@@ -1,6 +1,6 @@
 # GoGPU Roadmap
 
-> **Updated:** December 2025
+> **Updated:** January 2026
 
 ---
 
@@ -64,6 +64,7 @@ All platforms use Pure Go FFI (no CGO required).
 - ✅ DX12 backend complete — Pure Go COM via syscall
 - ✅ HLSL shader backend — DirectX 11/12
 - ✅ Metal macOS fixes — Issue #24
+- ✅ ARM64 ObjC typed arguments (v0.8.8, @ppoage)
 
 ### In Progress
 

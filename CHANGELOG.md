@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.8] - 2026-01-04
+
+### Fixed
+
+#### macOS ARM64
+- **ObjC Typed Arguments** — Proper type-safe wrappers for ARM64 AAPCS64 ABI compliance
+- **Triangle Demo** — Fixed shader WGSL and improved error handling
+- **Panic Safety** — Fixed segfault on panic with ObjC interop
+
+### Added
+- **Darwin ObjC Tests** — Comprehensive test coverage (1000+ lines in `darwin_objc_test.go`)
+- **Metal Backend Tests** — Platform-specific Metal tests
+- **Backend Registry Tests** — Backend selection and registration tests
+
+### Changed
+- Updated dependency: `github.com/go-webgpu/goffi` v0.3.6 → v0.3.7
+- Updated dependency: `github.com/go-webgpu/webgpu` v0.1.3 → v0.1.4
+- Updated dependency: `github.com/gogpu/wgpu` v0.8.6 → v0.8.7
+
+### Contributors
+- @ppoage — ARM64 ObjC fixes, tests, and triangle demo fix
+
 ## [0.8.7] - 2025-12-29
 
 ### Fixed
