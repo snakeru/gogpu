@@ -11,8 +11,9 @@ func TestBackendTypeString(t *testing.T) {
 	}{
 		{BackendAuto, "Auto"},
 		{BackendRust, "Rust (wgpu-native)"},
-		{BackendGo, "Pure Go"},
-		{BackendType(99), "Auto"}, // Unknown defaults to Auto
+		{BackendNative, "Native (Pure Go)"},
+		{BackendGo, "Native (Pure Go)"}, // Alias should return same string
+		{BackendType(99), "Auto"},       // Unknown defaults to Auto
 	}
 
 	for _, tt := range tests {
@@ -26,15 +27,19 @@ func TestBackendTypeString(t *testing.T) {
 }
 
 func TestBackendTypeValues(t *testing.T) {
-	// Verify iota ordering
+	// Verify iota ordering: Auto=0, Native=1 (default), Rust=2 (opt-in)
 	if BackendAuto != 0 {
 		t.Errorf("BackendAuto = %d, want 0", BackendAuto)
 	}
-	if BackendRust != 1 {
-		t.Errorf("BackendRust = %d, want 1", BackendRust)
+	if BackendNative != 1 {
+		t.Errorf("BackendNative = %d, want 1", BackendNative)
 	}
-	if BackendGo != 2 {
-		t.Errorf("BackendGo = %d, want 2", BackendGo)
+	if BackendRust != 2 {
+		t.Errorf("BackendRust = %d, want 2", BackendRust)
+	}
+	// BackendGo is an alias for BackendNative
+	if BackendGo != BackendNative {
+		t.Errorf("BackendGo = %d, want %d (BackendNative)", BackendGo, BackendNative)
 	}
 }
 
