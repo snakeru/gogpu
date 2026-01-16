@@ -7,7 +7,9 @@
 package native
 
 import (
+	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/gogpu/gogpu/gpu"
 	"github.com/gogpu/gogpu/gpu/types"
@@ -44,9 +46,11 @@ func (b *Backend) Init() error {
 
 // Destroy releases all backend resources.
 func (b *Backend) Destroy() {
-	// Note: This does NOT destroy HAL resources!
-	// Caller must explicitly release all handles before calling Destroy.
-	// This just clears the registry.
+	// Wait for all GPU operations to complete before destroying resources.
+	// This prevents hangs/crashes when closing the window.
+	b.registry.WaitAllDevicesIdle()
+
+	// Clear the registry (does not destroy HAL resources, but they will be GC'd)
 	b.registry.Clear()
 }
 
@@ -81,13 +85,44 @@ func (b *Backend) RequestAdapter(instance types.Instance, opts *types.AdapterOpt
 		return 0, fmt.Errorf("native: no adapters found")
 	}
 
-	// Pick first adapter for now
-	// TODO: Support power preference from opts
+	// Sort adapters based on power preference (matches wgpu-core behavior)
+	preferIntegrated := opts != nil && opts.PowerPreference == types.PowerPreferenceLowPower
+	sort.SliceStable(adapters, func(i, j int) bool {
+		return adapterOrder(adapters[i].Info.DeviceType, preferIntegrated) <
+			adapterOrder(adapters[j].Info.DeviceType, preferIntegrated)
+	})
+
+	// Pick best adapter (first after sorting)
 	exposed := adapters[0]
 
 	// Register and return handle
 	handle := b.registry.RegisterAdapter(exposed.Adapter)
 	return handle, nil
+}
+
+// adapterOrder returns the priority order for adapter selection.
+// Lower values = higher priority. Matches wgpu-core's request_adapter behavior.
+func adapterOrder(deviceType wgputypes.DeviceType, preferIntegrated bool) int {
+	switch deviceType {
+	case wgputypes.DeviceTypeDiscreteGPU:
+		if preferIntegrated {
+			return 2
+		}
+		return 1 // Best for high performance
+	case wgputypes.DeviceTypeIntegratedGPU:
+		if preferIntegrated {
+			return 1 // Best for low power
+		}
+		return 2
+	case wgputypes.DeviceTypeOther:
+		return 3 // Unknown (could be OpenGL)
+	case wgputypes.DeviceTypeVirtualGPU:
+		return 4
+	case wgputypes.DeviceTypeCPU:
+		return 5 // Software fallback (worst)
+	default:
+		return 6
+	}
 }
 
 // RequestDevice requests a GPU device.
@@ -150,6 +185,9 @@ func (b *Backend) ConfigureSurface(surface types.Surface, device types.Device, c
 		return
 	}
 
+	// Store surface → device mapping for Present()
+	b.registry.RegisterSurfaceDevice(surface, device)
+
 	// Convert config
 	halConfig := &hal.SurfaceConfiguration{
 		Format:      convertTextureFormat(config.Format),
@@ -171,15 +209,28 @@ func (b *Backend) GetCurrentTexture(surface types.Surface) (types.SurfaceTexture
 		return types.SurfaceTexture{Status: types.SurfaceStatusError}, err
 	}
 
-	// Acquire texture (fence=nil for now)
+	// Acquire texture (non-blocking)
 	acquired, err := halSurface.AcquireTexture(nil)
 	if err != nil {
+		// Check for "not ready" - this means skip frame, not an error
+		if errors.Is(err, hal.ErrNotReady) {
+			return types.SurfaceTexture{Status: types.SurfaceStatusTimeout}, nil
+		}
 		// Map HAL errors to surface status
 		return types.SurfaceTexture{Status: types.SurfaceStatusError}, err
 	}
 
-	// Register texture and return
-	textureHandle := b.registry.RegisterTexture(acquired.Texture)
+	// Store the SurfaceTexture for Present() to use later
+	b.registry.SetCurrentSurfaceTexture(surface, acquired.Texture)
+
+	// Get device for this surface (stored in ConfigureSurface)
+	device, err := b.registry.GetDeviceForSurface(surface)
+	if err != nil {
+		return types.SurfaceTexture{Status: types.SurfaceStatusError}, err
+	}
+
+	// Register texture WITH device (required for CreateTextureView)
+	textureHandle := b.registry.RegisterTextureForDevice(acquired.Texture, device)
 
 	return types.SurfaceTexture{
 		Texture: textureHandle,
@@ -189,10 +240,40 @@ func (b *Backend) GetCurrentTexture(surface types.Surface) (types.SurfaceTexture
 
 // Present presents the surface.
 func (b *Backend) Present(surface types.Surface) {
-	// Presentation happens via Queue.Present in HAL
-	// We need to get the queue and call Present on it
-	// For now, this is a no-op - presentation will happen in Submit
-	// TODO: Proper presentation flow
+	// Get the HAL surface
+	halSurface, err := b.registry.GetSurface(surface)
+	if err != nil {
+		return
+	}
+
+	// Get the SurfaceTexture stored in GetCurrentTexture
+	surfaceTexture := b.registry.GetCurrentSurfaceTexture(surface)
+	if surfaceTexture == nil {
+		return
+	}
+
+	// Get the device for this surface (stored in ConfigureSurface)
+	device, err := b.registry.GetDeviceForSurface(surface)
+	if err != nil {
+		return
+	}
+
+	// Get the queue for this device
+	queueHandle, err := b.registry.GetQueueForDevice(device)
+	if err != nil {
+		return
+	}
+
+	halQueue, err := b.registry.GetQueue(queueHandle)
+	if err != nil {
+		return
+	}
+
+	// Present the surface texture via HAL queue
+	_ = halQueue.Present(halSurface, surfaceTexture)
+
+	// Clear the stored texture (it's consumed after Present)
+	b.registry.ClearCurrentSurfaceTexture(surface)
 }
 
 // CreateShaderModuleWGSL creates a shader module from WGSL code.
@@ -285,6 +366,12 @@ func (b *Backend) CreateCommandEncoder(device types.Device) types.CommandEncoder
 
 	encoder, err := halDevice.CreateCommandEncoder(desc)
 	if err != nil {
+		return 0
+	}
+
+	// IMPORTANT: HAL requires BeginEncoding before any commands can be recorded.
+	// This must be called before BeginRenderPass, BeginComputePass, etc.
+	if err := encoder.BeginEncoding("frame"); err != nil {
 		return 0
 	}
 
@@ -406,20 +493,29 @@ func (b *Backend) CreateTextureView(texture types.Texture, desc *types.TextureVi
 		return 0
 	}
 
-	halDevice, err := b.registry.GetDevice(types.Device(1)) // HACK: assume device handle is 1
+	// Get device for this texture (stored in RegisterTextureForDevice)
+	deviceHandle, err := b.registry.GetDeviceForTexture(texture)
 	if err != nil {
 		return 0
 	}
 
-	// Convert descriptor
-	halDesc := &hal.TextureViewDescriptor{
-		Format:          convertTextureFormat(desc.Format),
-		Dimension:       convertTextureViewDimension(desc.Dimension),
-		Aspect:          convertTextureAspect(desc.Aspect),
-		BaseMipLevel:    desc.BaseMipLevel,
-		MipLevelCount:   desc.MipLevelCount,
-		BaseArrayLayer:  desc.BaseArrayLayer,
-		ArrayLayerCount: desc.ArrayLayerCount,
+	halDevice, err := b.registry.GetDevice(deviceHandle)
+	if err != nil {
+		return 0
+	}
+
+	// Convert descriptor (nil is allowed - HAL will use defaults)
+	var halDesc *hal.TextureViewDescriptor
+	if desc != nil {
+		halDesc = &hal.TextureViewDescriptor{
+			Format:          convertTextureFormat(desc.Format),
+			Dimension:       convertTextureViewDimension(desc.Dimension),
+			Aspect:          convertTextureAspect(desc.Aspect),
+			BaseMipLevel:    desc.BaseMipLevel,
+			MipLevelCount:   desc.MipLevelCount,
+			BaseArrayLayer:  desc.BaseArrayLayer,
+			ArrayLayerCount: desc.ArrayLayerCount,
+		}
 	}
 
 	view, err := halDevice.CreateTextureView(halTexture, halDesc)

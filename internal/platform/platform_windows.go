@@ -18,33 +18,43 @@ const (
 	wmDestroy          = 0x0002
 	wmSize             = 0x0005
 	wmClose            = 0x0010
+	wmEnterSizeMove    = 0x0231 // Start of resize/move modal loop
+	wmExitSizeMove     = 0x0232 // End of resize/move modal loop
 	wmKeydown          = 0x0100
 	wmKeyup            = 0x0101
 	idcArrow           = 32512
 	swShowNormal       = 1
+	swShow             = 5
+	swRestore          = 9
 	pmRemove           = 0x0001
 	wsOverlappedWindow = 0x00CF0000
 	wsVisible          = 0x10000000
 	cwUseDefault       = 0x80000000
 	vkEscape           = 0x1B
+	swpNoActivate      = 0x0010 // SWP_NOACTIVATE
 )
 
 var (
-	user32               = windows.NewLazyDLL("user32.dll")
-	kernel32             = windows.NewLazyDLL("kernel32.dll")
-	procRegisterClassExW = user32.NewProc("RegisterClassExW")
-	procCreateWindowExW  = user32.NewProc("CreateWindowExW")
-	procShowWindow       = user32.NewProc("ShowWindow")
-	procUpdateWindow     = user32.NewProc("UpdateWindow")
-	procPeekMessageW     = user32.NewProc("PeekMessageW")
-	procTranslateMessage = user32.NewProc("TranslateMessage")
-	procDispatchMessageW = user32.NewProc("DispatchMessageW")
-	procDefWindowProcW   = user32.NewProc("DefWindowProcW")
-	procPostQuitMessage  = user32.NewProc("PostQuitMessage")
-	procLoadCursorW      = user32.NewProc("LoadCursorW")
-	procGetModuleHandleW = kernel32.NewProc("GetModuleHandleW")
-	procDestroyWindow    = user32.NewProc("DestroyWindow")
-	procGetClientRect    = user32.NewProc("GetClientRect")
+	user32                 = windows.NewLazyDLL("user32.dll")
+	kernel32               = windows.NewLazyDLL("kernel32.dll")
+	procRegisterClassExW   = user32.NewProc("RegisterClassExW")
+	procCreateWindowExW    = user32.NewProc("CreateWindowExW")
+	procShowWindow         = user32.NewProc("ShowWindow")
+	procUpdateWindow       = user32.NewProc("UpdateWindow")
+	procSetForegroundWnd   = user32.NewProc("SetForegroundWindow")
+	procGetForegroundWnd   = user32.NewProc("GetForegroundWindow")
+	procGetWindowThreadPID = user32.NewProc("GetWindowThreadProcessId")
+	procAttachThreadInput  = user32.NewProc("AttachThreadInput")
+	procPeekMessageW       = user32.NewProc("PeekMessageW")
+	procTranslateMessage   = user32.NewProc("TranslateMessage")
+	procDispatchMessageW   = user32.NewProc("DispatchMessageW")
+	procDefWindowProcW     = user32.NewProc("DefWindowProcW")
+	procPostQuitMessage    = user32.NewProc("PostQuitMessage")
+	procLoadCursorW        = user32.NewProc("LoadCursorW")
+	procGetModuleHandleW   = kernel32.NewProc("GetModuleHandleW")
+	procGetCurrentThreadID = kernel32.NewProc("GetCurrentThreadId")
+	procDestroyWindow      = user32.NewProc("DestroyWindow")
+	procGetClientRect      = user32.NewProc("GetClientRect")
 )
 
 // WNDCLASSEXW is the Win32 WNDCLASSEXW structure.
@@ -85,6 +95,7 @@ type windowsPlatform struct {
 	width       int
 	height      int
 	shouldClose bool
+	inSizeMove  bool // True during modal resize/move loop
 	events      []Event
 	eventMu     sync.Mutex
 }
@@ -225,6 +236,20 @@ func (p *windowsPlatform) Destroy() {
 func (p *windowsPlatform) queueEvent(event Event) {
 	p.eventMu.Lock()
 	defer p.eventMu.Unlock()
+
+	// Coalesce resize events to avoid swapchain recreation storm.
+	// During drag resize, Windows sends hundreds of WM_SIZE messages.
+	// We only care about the final size.
+	if event.Type == EventResize && len(p.events) > 0 {
+		last := &p.events[len(p.events)-1]
+		if last.Type == EventResize {
+			// Update existing resize event with new dimensions
+			last.Width = event.Width
+			last.Height = event.Height
+			return
+		}
+	}
+
 	p.events = append(p.events, event)
 }
 
@@ -252,12 +277,30 @@ func wndProc(hwnd windows.HWND, message uint32, wParam, lParam uintptr) uintptr 
 		if newWidth > 0 && newHeight > 0 && (newWidth != p.width || newHeight != p.height) {
 			p.width = newWidth
 			p.height = newHeight
-			p.queueEvent(Event{
-				Type:   EventResize,
-				Width:  newWidth,
-				Height: newHeight,
-			})
+			// During modal resize loop, don't queue events - wait for WM_EXITSIZEMOVE
+			if !p.inSizeMove {
+				p.queueEvent(Event{
+					Type:   EventResize,
+					Width:  newWidth,
+					Height: newHeight,
+				})
+			}
 		}
+		return 0
+
+	case wmEnterSizeMove:
+		p.inSizeMove = true
+		return 0
+
+	case wmExitSizeMove:
+		p.inSizeMove = false
+		// Queue final resize event when resize ends
+		p.updateSize()
+		p.queueEvent(Event{
+			Type:   EventResize,
+			Width:  p.width,
+			Height: p.height,
+		})
 		return 0
 
 	case wmKeydown:
