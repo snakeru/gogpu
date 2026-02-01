@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/gogpu/gogpu/gpu"
 	"github.com/gogpu/gogpu/gpu/types"
@@ -384,7 +385,8 @@ func (b *Backend) CreateCommandEncoder(device types.Device) types.CommandEncoder
 		return 0
 	}
 
-	handle := b.registry.RegisterCommandEncoder(encoder)
+	// Register encoder with device so we can free the command buffer to correct pool
+	handle := b.registry.RegisterCommandEncoderForDevice(encoder, device)
 	return handle
 }
 
@@ -440,29 +442,63 @@ func (b *Backend) FinishEncoder(encoder types.CommandEncoder) types.CommandBuffe
 		return 0
 	}
 
+	// Get the device this encoder was created from (for proper command buffer freeing)
+	device := b.registry.GetCommandEncoderDevice(encoder)
+
 	cmdBuffer, err := halEncoder.EndEncoding()
 	if err != nil {
 		return 0
 	}
 
-	handle := b.registry.RegisterCommandBuffer(cmdBuffer)
+	// Register command buffer with device so it can be freed to correct pool
+	handle := b.registry.RegisterCommandBufferForDevice(cmdBuffer, device)
 	return handle
 }
 
-// Submit submits commands to the queue.
-func (b *Backend) Submit(queue types.Queue, commands types.CommandBuffer) {
+// Submit submits commands to the queue with optional fence signaling.
+// If fence is non-zero, it will be signaled with fenceValue when commands complete.
+// Returns the submission index for tracking completion.
+func (b *Backend) Submit(queue types.Queue, commands types.CommandBuffer, fence types.Fence, fenceValue uint64) types.SubmissionIndex {
 	halQueue, err := b.registry.GetQueue(queue)
 	if err != nil {
-		return
+		return 0
 	}
 
 	halCmdBuffer, err := b.registry.GetCommandBuffer(commands)
 	if err != nil {
-		return
+		return 0
 	}
 
-	// Submit with no fence
-	_ = halQueue.Submit([]hal.CommandBuffer{halCmdBuffer}, nil, 0)
+	// Get HAL fence if provided
+	var halFence hal.Fence
+	if fence != 0 {
+		halFence, _ = b.registry.GetFence(fence)
+	}
+
+	// Submit with fence signaling
+	_ = halQueue.Submit([]hal.CommandBuffer{halCmdBuffer}, halFence, fenceValue)
+
+	return types.SubmissionIndex(fenceValue)
+}
+
+// GetFenceStatus returns true if the fence is signaled (non-blocking).
+func (b *Backend) GetFenceStatus(fence types.Fence) (bool, error) {
+	halFence, err := b.registry.GetFence(fence)
+	if err != nil {
+		return false, err
+	}
+
+	deviceHandle, err := b.registry.GetFenceDevice(fence)
+	if err != nil {
+		return false, err
+	}
+
+	halDevice, err := b.registry.GetDevice(deviceHandle)
+	if err != nil {
+		return false, err
+	}
+
+	return halDevice.GetFenceStatus(halFence)
 }
 
 // SetPipeline sets the render pipeline.
@@ -924,7 +960,14 @@ func (b *Backend) ReleasePipelineLayout(layout types.PipelineLayout) {
 func (b *Backend) ReleaseCommandBuffer(buffer types.CommandBuffer) {
 	halBuffer, err := b.registry.GetCommandBuffer(buffer)
 	if err == nil && halBuffer != nil {
-		halBuffer.Destroy()
+		// Get device to free command buffer back to pool
+		deviceHandle := b.registry.GetCommandBufferDevice(buffer)
+		if deviceHandle != 0 {
+			halDevice, devErr := b.registry.GetDevice(deviceHandle)
+			if devErr == nil {
+				halDevice.FreeCommandBuffer(halBuffer)
+			}
+		}
 	}
 	b.registry.UnregisterCommandBuffer(buffer)
 }
@@ -978,6 +1021,70 @@ func (b *Backend) ResetCommandPool(device types.Device) {
 		// Reset the pool to reclaim memory
 		_ = resetter.ResetCommandPool()
 	}
+}
+
+// CreateFence creates a new fence in the unsignaled state.
+func (b *Backend) CreateFence(device types.Device) (types.Fence, error) {
+	halDevice, err := b.registry.GetDevice(device)
+	if err != nil {
+		return 0, fmt.Errorf("native: invalid device: %w", err)
+	}
+
+	halFence, err := halDevice.CreateFence()
+	if err != nil {
+		return 0, fmt.Errorf("native: failed to create fence: %w", err)
+	}
+
+	handle := b.registry.RegisterFence(halFence, device)
+	return handle, nil
+}
+
+// WaitFence waits for a fence to be signaled.
+func (b *Backend) WaitFence(device types.Device, fence types.Fence, timeout uint64) (bool, error) {
+	halDevice, err := b.registry.GetDevice(device)
+	if err != nil {
+		return false, fmt.Errorf("native: invalid device: %w", err)
+	}
+
+	halFence, err := b.registry.GetFence(fence)
+	if err != nil {
+		return false, fmt.Errorf("native: invalid fence: %w", err)
+	}
+
+	// Convert timeout from nanoseconds to time.Duration.
+	// Max int64 is ~292 years in nanoseconds - any practical timeout is safe.
+	return halDevice.Wait(halFence, 0, time.Duration(timeout)) //nolint:gosec // G115: practical timeouts won't overflow
+}
+
+// ResetFence resets a fence to the unsignaled state.
+func (b *Backend) ResetFence(device types.Device, fence types.Fence) error {
+	halDevice, err := b.registry.GetDevice(device)
+	if err != nil {
+		return fmt.Errorf("native: invalid device: %w", err)
+	}
+
+	halFence, err := b.registry.GetFence(fence)
+	if err != nil {
+		return fmt.Errorf("native: invalid fence: %w", err)
+	}
+
+	return halDevice.ResetFence(halFence)
+}
+
+// DestroyFence destroys a fence.
+func (b *Backend) DestroyFence(device types.Device, fence types.Fence) {
+	halDevice, err := b.registry.GetDevice(device)
+	if err != nil {
+		return
+	}
+
+	halFence, err := b.registry.GetFence(fence)
+	if err != nil {
+		return
+	}
+
+	halDevice.DestroyFence(halFence)
+	b.registry.UnregisterFence(fence)
 }
 
 // Ensure Backend implements gpu.Backend.

@@ -59,7 +59,11 @@ type Backend interface {
 	BeginComputePass(encoder types.CommandEncoder) types.ComputePass
 	EndComputePass(pass types.ComputePass)
 	FinishEncoder(encoder types.CommandEncoder) types.CommandBuffer
-	Submit(queue types.Queue, commands types.CommandBuffer)
+
+	// Submit submits commands to the queue with optional fence signaling.
+	// If fence is non-zero, it will be signaled with fenceValue when commands complete.
+	// Returns the submission index for tracking completion.
+	Submit(queue types.Queue, commands types.CommandBuffer, fence types.Fence, fenceValue uint64) types.SubmissionIndex
 
 	// Render pass operations
 	SetPipeline(pass types.RenderPass, pipeline types.RenderPipeline)
@@ -115,6 +119,27 @@ type Backend interface {
 	// This should be called periodically (e.g., after Present) when GPU is idle.
 	// Note: This is a temporary solution; proper fix requires per-frame command pools.
 	ResetCommandPool(device types.Device)
+
+	// Fence operations for GPU synchronization
+
+	// CreateFence creates a new fence in the unsignaled state.
+	CreateFence(device types.Device) (types.Fence, error)
+
+	// GetFenceStatus returns true if the fence is signaled (non-blocking).
+	// Use this for polling completion without blocking.
+	GetFenceStatus(fence types.Fence) (bool, error)
+
+	// WaitFence waits for a fence to be signaled.
+	// Returns true if signaled, false if timed out.
+	// timeout is in nanoseconds. Use 0 for non-blocking check.
+	WaitFence(device types.Device, fence types.Fence, timeout uint64) (bool, error)
+
+	// ResetFence resets a fence to the unsignaled state.
+	// The fence must not be in use by the GPU.
+	ResetFence(device types.Device, fence types.Fence) error
+
+	// DestroyFence destroys a fence.
+	DestroyFence(device types.Device, fence types.Fence)
 }
 
 // activeBackend is the currently selected backend.

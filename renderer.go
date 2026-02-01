@@ -40,6 +40,12 @@ type Renderer struct {
 	currentView    types.TextureView
 	frameCleared   bool // Whether the frame has been cleared (for LoadOp selection)
 
+	// FencePool for non-blocking submission tracking (wgpu-rs pattern).
+	// Each submission gets its own fence from the pool.
+	// Non-blocking: poll fence status to determine completed submissions.
+	fencePool         *FencePool
+	nextSubmissionIdx types.SubmissionIndex
+
 	// Built-in pipelines
 	trianglePipeline types.RenderPipeline
 	triangleShader   types.ShaderModule
@@ -52,7 +58,11 @@ type Renderer struct {
 	texQuadPipelineLayout types.PipelineLayout
 	texQuadUniformBuffer  types.Buffer
 	texQuadUniformBindGrp types.BindGroup
+	texQuadUniformData    []byte // Pre-allocated buffer for uniform data (reduces GC pressure)
 	texQuadPipelineInited bool
+
+	// Texture bind group cache - avoids creating new bind groups per draw call
+	texBindGroupCache map[types.TextureView]types.BindGroup
 
 	// Platform reference
 	platform platform.Platform
@@ -155,6 +165,10 @@ func (r *Renderer) init() error {
 
 	// Get queue
 	r.queue = r.backend.GetQueue(r.device)
+
+	// Create fence pool for non-blocking submission tracking (wgpu-rs pattern).
+	// Each submission gets its own fence, enabling true non-blocking completion checks.
+	r.fencePool = NewFencePool(r.backend, r.device)
 
 	// Configure surface
 	// Get current window dimensions. On some platforms (especially macOS),
@@ -268,10 +282,14 @@ func (r *Renderer) EndFrame() {
 	// can invalidate the drawable, causing blank frames.
 	r.backend.Present(r.surface)
 
-	// Reset command pool to reclaim memory from submitted command buffers.
-	// This is a temporary solution that blocks on GPU completion.
-	// TODO: Implement per-frame command pools for non-blocking cleanup.
-	r.backend.ResetCommandPool(r.device)
+	// Non-blocking submission tracking: poll completed submissions.
+	// This is the wgpu-rs FencePool pattern where each submission has its own fence.
+	// PollCompleted checks all active fences, recycles completed fences,
+	// and releases command buffers back to the pool via FreeCommandBuffer.
+	// No ResetCommandPool needed — individual buffers are freed when fences signal.
+	if r.fencePool != nil {
+		r.fencePool.PollCompleted()
+	}
 
 	// Release resources after presentation
 	if r.currentView != 0 {
@@ -312,11 +330,43 @@ func (r *Renderer) Clear(red, green, blue, alpha float64) {
 	commands := r.backend.FinishEncoder(encoder)
 	r.backend.ReleaseCommandEncoder(encoder)
 
-	r.backend.Submit(r.queue, commands)
-	r.backend.ReleaseCommandBuffer(commands)
+	// Submit with fence tracking (command buffer released when GPU done)
+	r.submitWithFence(commands)
 
 	// Mark frame as cleared for subsequent draw calls
 	r.frameCleared = true
+}
+
+// submitWithFence submits commands with a fence for non-blocking tracking.
+// The command buffer is stored and released only when GPU finishes using it.
+// This follows wgpu-rs pattern: resources must remain alive until GPU completes.
+func (r *Renderer) submitWithFence(commands types.CommandBuffer) {
+	if r.fencePool == nil {
+		// No fence pool - submit and release immediately (legacy behavior)
+		r.backend.Submit(r.queue, commands, 0, 0)
+		r.backend.ReleaseCommandBuffer(commands)
+		return
+	}
+
+	// Acquire fence from pool
+	fence, err := r.fencePool.AcquireFence()
+	if err != nil {
+		// Fence acquisition failed - submit and release immediately
+		r.backend.Submit(r.queue, commands, 0, 0)
+		r.backend.ReleaseCommandBuffer(commands)
+		return
+	}
+
+	// Increment submission index
+	r.nextSubmissionIdx++
+	subIdx := r.nextSubmissionIdx
+
+	// Submit with fence signaling
+	r.backend.Submit(r.queue, commands, fence, uint64(subIdx))
+
+	// Track submission WITH command buffer for deferred release.
+	// Command buffer will be released when fence signals (GPU done).
+	r.fencePool.TrackSubmission(subIdx, fence, commands)
 }
 
 // Size returns the current render target size.
@@ -401,8 +451,8 @@ func (r *Renderer) DrawTriangle(clearR, clearG, clearB, clearA float64) error {
 	commands := r.backend.FinishEncoder(encoder)
 	r.backend.ReleaseCommandEncoder(encoder)
 
-	r.backend.Submit(r.queue, commands)
-	r.backend.ReleaseCommandBuffer(commands)
+	// Submit with fence tracking (command buffer released when GPU done)
+	r.submitWithFence(commands)
 
 	return nil
 }
@@ -530,8 +580,48 @@ func (r *Renderer) initTexturedQuadPipeline() error {
 		return fmt.Errorf("gogpu: failed to create uniform bind group: %w", err)
 	}
 
+	// Pre-allocate uniform data buffer to avoid per-frame allocations
+	r.texQuadUniformData = make([]byte, texQuadUniformSize)
+
 	r.texQuadPipelineInited = true
 	return nil
+}
+
+// getOrCreateTexBindGroup returns a cached bind group for the texture, or creates one.
+// This avoids creating a new GPU bind group for every draw call with the same texture.
+func (r *Renderer) getOrCreateTexBindGroup(tex *Texture) (types.BindGroup, error) {
+	// Initialize cache lazily
+	if r.texBindGroupCache == nil {
+		r.texBindGroupCache = make(map[types.TextureView]types.BindGroup)
+	}
+
+	// Check cache first
+	if bg, ok := r.texBindGroupCache[tex.view]; ok {
+		return bg, nil
+	}
+
+	// Create new bind group for this texture
+	bg, err := r.backend.CreateBindGroup(r.device, &types.BindGroupDescriptor{
+		Label:  "Textured Quad Texture Bind Group",
+		Layout: r.texQuadTextureLayout,
+		Entries: []types.BindGroupEntry{
+			{
+				Binding: 0,
+				Sampler: tex.sampler,
+			},
+			{
+				Binding:     1,
+				TextureView: tex.view,
+			},
+		},
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	// Store in cache
+	r.texBindGroupCache[tex.view] = bg
+	return bg, nil
 }
 
 // drawTexturedQuad draws a textured quad with the given options.
@@ -548,40 +638,25 @@ func (r *Renderer) drawTexturedQuad(tex *Texture, opts DrawTextureOptions) error
 		}
 	}
 
-	// Prepare uniform data
+	// Prepare uniform data (reuse pre-allocated buffer)
 	// Layout: rect(x,y,w,h) + screen(w,h) + alpha + pad
-	uniformData := make([]byte, texQuadUniformSize)
-	binary.LittleEndian.PutUint32(uniformData[0:4], math.Float32bits(opts.X))
-	binary.LittleEndian.PutUint32(uniformData[4:8], math.Float32bits(opts.Y))
-	binary.LittleEndian.PutUint32(uniformData[8:12], math.Float32bits(opts.Width))
-	binary.LittleEndian.PutUint32(uniformData[12:16], math.Float32bits(opts.Height))
-	binary.LittleEndian.PutUint32(uniformData[16:20], math.Float32bits(float32(r.width)))
-	binary.LittleEndian.PutUint32(uniformData[20:24], math.Float32bits(float32(r.height)))
-	binary.LittleEndian.PutUint32(uniformData[24:28], math.Float32bits(opts.Alpha))
-	binary.LittleEndian.PutUint32(uniformData[28:32], 0) // padding
+	binary.LittleEndian.PutUint32(r.texQuadUniformData[0:4], math.Float32bits(opts.X))
+	binary.LittleEndian.PutUint32(r.texQuadUniformData[4:8], math.Float32bits(opts.Y))
+	binary.LittleEndian.PutUint32(r.texQuadUniformData[8:12], math.Float32bits(opts.Width))
+	binary.LittleEndian.PutUint32(r.texQuadUniformData[12:16], math.Float32bits(opts.Height))
+	binary.LittleEndian.PutUint32(r.texQuadUniformData[16:20], math.Float32bits(float32(r.width)))
+	binary.LittleEndian.PutUint32(r.texQuadUniformData[20:24], math.Float32bits(float32(r.height)))
+	binary.LittleEndian.PutUint32(r.texQuadUniformData[24:28], math.Float32bits(opts.Alpha))
+	binary.LittleEndian.PutUint32(r.texQuadUniformData[28:32], 0) // padding
 
 	// Upload uniform data
-	r.backend.WriteBuffer(r.queue, r.texQuadUniformBuffer, 0, uniformData)
+	r.backend.WriteBuffer(r.queue, r.texQuadUniformBuffer, 0, r.texQuadUniformData)
 
-	// Create bind group for texture (group 1) - per-draw resource
-	texBindGroup, err := r.backend.CreateBindGroup(r.device, &types.BindGroupDescriptor{
-		Label:  "Textured Quad Texture Bind Group",
-		Layout: r.texQuadTextureLayout,
-		Entries: []types.BindGroupEntry{
-			{
-				Binding: 0,
-				Sampler: tex.sampler,
-			},
-			{
-				Binding:     1,
-				TextureView: tex.view,
-			},
-		},
-	})
+	// Get or create cached bind group for texture (group 1)
+	texBindGroup, err := r.getOrCreateTexBindGroup(tex)
 	if err != nil {
-		return fmt.Errorf("gogpu: failed to create texture bind group: %w", err)
+		return fmt.Errorf("gogpu: failed to get texture bind group: %w", err)
 	}
-	defer r.backend.ReleaseBindGroup(texBindGroup)
 
 	// Create command encoder
 	encoder := r.backend.CreateCommandEncoder(r.device)
@@ -623,8 +698,8 @@ func (r *Renderer) drawTexturedQuad(tex *Texture, opts DrawTextureOptions) error
 	commands := r.backend.FinishEncoder(encoder)
 	r.backend.ReleaseCommandEncoder(encoder)
 
-	r.backend.Submit(r.queue, commands)
-	r.backend.ReleaseCommandBuffer(commands)
+	// Submit with fence tracking (command buffer released when GPU done)
+	r.submitWithFence(commands)
 
 	// Mark frame as having content (for subsequent LoadOp)
 	r.frameCleared = true
@@ -634,6 +709,14 @@ func (r *Renderer) drawTexturedQuad(tex *Texture, opts DrawTextureOptions) error
 
 // Destroy releases all GPU resources.
 func (r *Renderer) Destroy() {
+	// Wait for all GPU work to complete before destroying resources.
+	// This prevents crashes from destroying resources that are still in use.
+	// FencePool.Destroy() waits for all active submissions to complete.
+	if r.fencePool != nil {
+		r.fencePool.Destroy()
+		r.fencePool = nil
+	}
+
 	if r.currentView != 0 {
 		r.backend.ReleaseTextureView(r.currentView)
 		r.currentView = 0
@@ -641,6 +724,12 @@ func (r *Renderer) Destroy() {
 	if r.currentTexture != 0 {
 		r.backend.ReleaseTexture(r.currentTexture)
 		r.currentTexture = 0
+	}
+
+	// Release cached texture bind groups
+	for view, bg := range r.texBindGroupCache {
+		r.backend.ReleaseBindGroup(bg)
+		delete(r.texBindGroupCache, view)
 	}
 
 	// Release textured quad pipeline resources

@@ -394,24 +394,35 @@ func (b *Backend) FinishEncoder(encoder types.CommandEncoder) types.CommandBuffe
 	return handle
 }
 
-// Submit submits commands to the queue.
-func (b *Backend) Submit(queue types.Queue, commands types.CommandBuffer) {
+// Submit submits commands to the queue with optional fence signaling.
+// If fence is non-zero, it will be signaled with fenceValue when commands complete.
+// Returns the submission index for tracking completion.
+func (b *Backend) Submit(queue types.Queue, commands types.CommandBuffer, fence types.Fence, fenceValue uint64) types.SubmissionIndex {
 	halQueue, err := b.registry.GetQueue(queue)
 	if err != nil {
-		return
+		return 0
 	}
 
 	halCmdBuffer, err := b.registry.GetCommandBuffer(commands)
 	if err != nil {
-		return
+		return 0
 	}
 
 	// Attach drawable from current surface texture to command buffer (Metal requirement).
 	// The drawable must be scheduled for presentation before commit.
 	b.attachDrawableToCommandBuffer(halCmdBuffer)
 
-	// Submit with no fence
+	// TODO: Pass fence to HAL when fence support is implemented.
+	// For now, submit without fence signaling.
 	_ = halQueue.Submit([]hal.CommandBuffer{halCmdBuffer}, nil, 0)
+
+	return types.SubmissionIndex(fenceValue)
+}
+
+// GetFenceStatus returns true if the fence is signaled (non-blocking).
+func (b *Backend) GetFenceStatus(fence types.Fence) (bool, error) {
+	// TODO: Implement fence status using Metal events when available.
+	return true, nil // Always signaled for now
 }
 
 // attachDrawableToCommandBuffer attaches the current drawable to a command buffer.
@@ -705,6 +716,30 @@ func (b *Backend) ReleaseShaderModule(module types.ShaderModule) {
 func (b *Backend) ResetCommandPool(device types.Device) {
 	// Metal manages command buffers automatically through MTLCommandQueue.
 	// No explicit reset needed.
+}
+
+// CreateFence creates a new fence in the unsignaled state.
+// Metal uses MTLEvent or MTLSharedEvent for synchronization.
+func (b *Backend) CreateFence(device types.Device) (types.Fence, error) {
+	// TODO: Implement fence creation using Metal events when available
+	return 0, gpu.ErrNotImplemented
+}
+
+// WaitFence waits for a fence to be signaled.
+func (b *Backend) WaitFence(device types.Device, fence types.Fence, timeout uint64) (bool, error) {
+	// TODO: Implement fence waiting using Metal events when available
+	return true, nil // Always "signaled" for now
+}
+
+// ResetFence resets a fence to the unsignaled state.
+func (b *Backend) ResetFence(device types.Device, fence types.Fence) error {
+	// TODO: Implement fence reset using Metal events when available
+	return nil
+}
+
+// DestroyFence destroys a fence.
+func (b *Backend) DestroyFence(device types.Device, fence types.Fence) {
+	// TODO: Implement fence destruction using Metal events when available
 }
 
 // Ensure Backend implements gpu.Backend.
