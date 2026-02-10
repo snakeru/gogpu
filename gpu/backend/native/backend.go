@@ -1,9 +1,10 @@
-//go:build windows || linux
+//go:build windows || linux || darwin
 
 // Package native provides the WebGPU backend using pure Go (gogpu/wgpu).
 // This backend offers zero dependencies and simple cross-compilation.
 //
-// Implementation uses gogpu/wgpu HAL (Hardware Abstraction Layer) with Vulkan backend.
+// Implementation uses gogpu/wgpu HAL (Hardware Abstraction Layer) with
+// platform-specific backends: Vulkan on Windows/Linux, Metal on macOS.
 package native
 
 import (
@@ -16,26 +17,27 @@ import (
 	"github.com/gogpu/gogpu/gpu/types"
 	"github.com/gogpu/gputypes"
 	"github.com/gogpu/wgpu/hal"
-	"github.com/gogpu/wgpu/hal/vulkan"
 )
 
 // Backend implements gpu.Backend using pure Go wgpu HAL.
 type Backend struct {
-	registry *ResourceRegistry
-	backend  hal.Backend
+	registry    *ResourceRegistry
+	backend     hal.Backend
+	bufferSizes map[types.Buffer]uint64
 }
 
 // New creates a new Pure Go backend.
 func New() *Backend {
 	return &Backend{
-		registry: NewResourceRegistry(),
-		backend:  vulkan.Backend{}, // Vulkan is the first HAL implementation
+		registry:    NewResourceRegistry(),
+		backend:     newHalBackend(),
+		bufferSizes: make(map[types.Buffer]uint64),
 	}
 }
 
 // Name returns the backend identifier.
 func (b *Backend) Name() string {
-	return "Pure Go (gogpu/wgpu/vulkan)"
+	return halBackendName()
 }
 
 // Init initializes the backend.
@@ -59,13 +61,13 @@ func (b *Backend) Destroy() {
 func (b *Backend) CreateInstance() (types.Instance, error) {
 	// Create HAL instance with default config
 	desc := &hal.InstanceDescriptor{
-		Backends: gputypes.Backends(1 << gputypes.BackendVulkan), // Vulkan backend
-		Flags:    0,                                              // No debug for now
+		Backends: gputypes.Backends(1 << halBackendVariant()),
+		Flags:    0, // No debug for now
 	}
 
 	halInstance, err := b.backend.CreateInstance(desc)
 	if err != nil {
-		return 0, fmt.Errorf("native: failed to create instance: %w", err)
+		return 0, fmt.Errorf("gpu: failed to create instance: %w", err)
 	}
 
 	// Register and return handle
@@ -83,7 +85,7 @@ func (b *Backend) RequestAdapter(instance types.Instance, opts *types.AdapterOpt
 	// Enumerate adapters
 	adapters := halInstance.EnumerateAdapters(nil) // nil = no surface hint
 	if len(adapters) == 0 {
-		return 0, fmt.Errorf("native: no adapters found")
+		return 0, fmt.Errorf("gpu: no adapters found")
 	}
 
 	// Sort adapters based on power preference (matches wgpu-core behavior)
@@ -136,14 +138,14 @@ func (b *Backend) RequestDevice(adapter types.Adapter, opts *types.DeviceOptions
 	// Open device with default features and limits
 	openDevice, err := halAdapter.Open(gputypes.Features(0), gputypes.DefaultLimits())
 	if err != nil {
-		return 0, fmt.Errorf("native: failed to open device: %w", err)
+		return 0, fmt.Errorf("gpu: failed to open device: %w", err)
 	}
 
 	// Register device and queue
 	deviceHandle := b.registry.RegisterDevice(openDevice.Device)
 	queueHandle := b.registry.RegisterQueue(openDevice.Queue)
 
-	// Store device→queue mapping
+	// Store device->queue mapping
 	b.registry.RegisterDeviceQueue(deviceHandle, queueHandle)
 
 	return deviceHandle, nil
@@ -167,7 +169,7 @@ func (b *Backend) CreateSurface(instance types.Instance, handle types.SurfaceHan
 
 	halSurface, err := halInstance.CreateSurface(handle.Instance, handle.Window)
 	if err != nil {
-		return 0, fmt.Errorf("native: failed to create surface: %w", err)
+		return 0, fmt.Errorf("gpu: failed to create surface: %w", err)
 	}
 
 	surfaceHandle := b.registry.RegisterSurface(halSurface)
@@ -186,7 +188,7 @@ func (b *Backend) ConfigureSurface(surface types.Surface, device types.Device, c
 		return
 	}
 
-	// Store surface → device mapping for Present()
+	// Store surface -> device mapping for Present()
 	b.registry.RegisterSurfaceDevice(surface, device)
 
 	// Convert config - all types are now gputypes aliases, no conversion needed
@@ -291,7 +293,7 @@ func (b *Backend) CreateShaderModuleWGSL(device types.Device, code string) (type
 
 	module, err := halDevice.CreateShaderModule(desc)
 	if err != nil {
-		return 0, fmt.Errorf("native: failed to create shader module: %w", err)
+		return 0, fmt.Errorf("gpu: failed to create shader module: %w", err)
 	}
 
 	handle := b.registry.RegisterShaderModule(module)
@@ -321,7 +323,7 @@ func (b *Backend) CreateRenderPipeline(device types.Device, desc *types.RenderPi
 	if desc.Layout != 0 {
 		halLayout, err = b.registry.GetPipelineLayout(desc.Layout)
 		if err != nil {
-			return 0, fmt.Errorf("native: invalid pipeline layout: %w", err)
+			return 0, fmt.Errorf("gpu: invalid pipeline layout: %w", err)
 		}
 	}
 
@@ -356,7 +358,7 @@ func (b *Backend) CreateRenderPipeline(device types.Device, desc *types.RenderPi
 
 	pipeline, err := halDevice.CreateRenderPipeline(halDesc)
 	if err != nil {
-		return 0, fmt.Errorf("native: failed to create render pipeline: %w", err)
+		return 0, fmt.Errorf("gpu: failed to create render pipeline: %w", err)
 	}
 
 	handle := b.registry.RegisterRenderPipeline(pipeline)
@@ -400,8 +402,8 @@ func (b *Backend) BeginRenderPass(encoder types.CommandEncoder, desc *types.Rend
 	// Convert color attachments - types are gputypes aliases now
 	colorAttachments := make([]hal.RenderPassColorAttachment, 0, len(desc.ColorAttachments))
 	for _, ca := range desc.ColorAttachments {
-		view, err := b.registry.GetTextureView(ca.View)
-		if err != nil {
+		view, viewErr := b.registry.GetTextureView(ca.View)
+		if viewErr != nil {
 			continue
 		}
 
@@ -475,6 +477,9 @@ func (b *Backend) Submit(queue types.Queue, commands types.CommandBuffer, fence 
 		halFence, _ = b.registry.GetFence(fence)
 	}
 
+	// Platform-specific pre-submit hook (Metal drawable attachment)
+	platformPreSubmit(halCmdBuffer, b.registry)
+
 	// Submit with fence signaling
 	_ = halQueue.Submit([]hal.CommandBuffer{halCmdBuffer}, halFence, fenceValue)
 
@@ -528,10 +533,11 @@ func (b *Backend) Draw(pass types.RenderPass, vertexCount, instanceCount, firstV
 
 // --- Texture operations ---
 
+// CreateTexture creates a GPU texture.
 func (b *Backend) CreateTexture(device types.Device, desc *types.TextureDescriptor) (types.Texture, error) {
 	halDevice, err := b.registry.GetDevice(device)
 	if err != nil {
-		return 0, fmt.Errorf("native: invalid device: %w", err)
+		return 0, fmt.Errorf("gpu: invalid device: %w", err)
 	}
 
 	halDesc := &hal.TextureDescriptor{
@@ -546,13 +552,14 @@ func (b *Backend) CreateTexture(device types.Device, desc *types.TextureDescript
 
 	texture, err := halDevice.CreateTexture(halDesc)
 	if err != nil {
-		return 0, fmt.Errorf("native: failed to create texture: %w", err)
+		return 0, fmt.Errorf("gpu: failed to create texture: %w", err)
 	}
 
 	handle := b.registry.RegisterTextureForDevice(texture, device)
 	return handle, nil
 }
 
+// CreateTextureView creates a texture view.
 func (b *Backend) CreateTextureView(texture types.Texture, desc *types.TextureViewDescriptor) types.TextureView {
 	halTexture, err := b.registry.GetTexture(texture)
 	if err != nil {
@@ -593,6 +600,7 @@ func (b *Backend) CreateTextureView(texture types.Texture, desc *types.TextureVi
 	return handle
 }
 
+// WriteTexture writes data to a texture.
 func (b *Backend) WriteTexture(queue types.Queue, dst *types.ImageCopyTexture, data []byte, layout *types.ImageDataLayout, size *gputypes.Extent3D) {
 	halQueue, err := b.registry.GetQueue(queue)
 	if err != nil {
@@ -626,10 +634,11 @@ func (b *Backend) WriteTexture(queue types.Queue, dst *types.ImageCopyTexture, d
 	halQueue.WriteTexture(halDst, data, halLayout, halSize)
 }
 
+// CreateSampler creates a texture sampler.
 func (b *Backend) CreateSampler(device types.Device, desc *types.SamplerDescriptor) (types.Sampler, error) {
 	halDevice, err := b.registry.GetDevice(device)
 	if err != nil {
-		return 0, fmt.Errorf("native: invalid device: %w", err)
+		return 0, fmt.Errorf("gpu: invalid device: %w", err)
 	}
 
 	halDesc := &hal.SamplerDescriptor{
@@ -648,17 +657,18 @@ func (b *Backend) CreateSampler(device types.Device, desc *types.SamplerDescript
 
 	sampler, err := halDevice.CreateSampler(halDesc)
 	if err != nil {
-		return 0, fmt.Errorf("native: failed to create sampler: %w", err)
+		return 0, fmt.Errorf("gpu: failed to create sampler: %w", err)
 	}
 
 	handle := b.registry.RegisterSampler(sampler)
 	return handle, nil
 }
 
+// CreateBuffer creates a GPU buffer.
 func (b *Backend) CreateBuffer(device types.Device, desc *types.BufferDescriptor) (types.Buffer, error) {
 	halDevice, err := b.registry.GetDevice(device)
 	if err != nil {
-		return 0, fmt.Errorf("native: invalid device: %w", err)
+		return 0, fmt.Errorf("gpu: invalid device: %w", err)
 	}
 
 	// For uniform/copy-dst buffers, we need mapped memory for WriteBuffer to work
@@ -677,13 +687,15 @@ func (b *Backend) CreateBuffer(device types.Device, desc *types.BufferDescriptor
 
 	buffer, err := halDevice.CreateBuffer(halDesc)
 	if err != nil {
-		return 0, fmt.Errorf("native: failed to create buffer: %w", err)
+		return 0, fmt.Errorf("gpu: failed to create buffer: %w", err)
 	}
 
 	handle := b.registry.RegisterBuffer(buffer)
+	b.bufferSizes[handle] = desc.Size
 	return handle, nil
 }
 
+// WriteBuffer writes data to a buffer.
 func (b *Backend) WriteBuffer(queue types.Queue, buffer types.Buffer, offset uint64, data []byte) {
 	halQueue, err := b.registry.GetQueue(queue)
 	if err != nil {
@@ -698,10 +710,30 @@ func (b *Backend) WriteBuffer(queue types.Queue, buffer types.Buffer, offset uin
 	halQueue.WriteBuffer(halBuffer, offset, data)
 }
 
+// CopyBufferToBuffer records a buffer-to-buffer copy command.
+func (b *Backend) CopyBufferToBuffer(encoder types.CommandEncoder, src types.Buffer, srcOffset uint64, dst types.Buffer, dstOffset, size uint64) {
+	halEncoder, err := b.registry.GetCommandEncoder(encoder)
+	if err != nil {
+		return
+	}
+	halSrc, err := b.registry.GetBuffer(src)
+	if err != nil {
+		return
+	}
+	halDst, err := b.registry.GetBuffer(dst)
+	if err != nil {
+		return
+	}
+	halEncoder.CopyBufferToBuffer(halSrc, halDst, []hal.BufferCopy{
+		{SrcOffset: srcOffset, DstOffset: dstOffset, Size: size},
+	})
+}
+
+// CreateBindGroupLayout creates a bind group layout.
 func (b *Backend) CreateBindGroupLayout(device types.Device, desc *types.BindGroupLayoutDescriptor) (types.BindGroupLayout, error) {
 	halDevice, err := b.registry.GetDevice(device)
 	if err != nil {
-		return 0, fmt.Errorf("native: invalid device: %w", err)
+		return 0, fmt.Errorf("gpu: invalid device: %w", err)
 	}
 
 	// Convert entries to HAL format
@@ -723,25 +755,26 @@ func (b *Backend) CreateBindGroupLayout(device types.Device, desc *types.BindGro
 
 	layout, err := halDevice.CreateBindGroupLayout(halDesc)
 	if err != nil {
-		return 0, fmt.Errorf("native: failed to create bind group layout: %w", err)
+		return 0, fmt.Errorf("gpu: failed to create bind group layout: %w", err)
 	}
 
 	handle := b.registry.RegisterBindGroupLayout(layout)
 	return handle, nil
 }
 
+// CreateBindGroup creates a bind group.
 func (b *Backend) CreateBindGroup(device types.Device, desc *types.BindGroupDescriptor) (types.BindGroup, error) {
 	halDevice, err := b.registry.GetDevice(device)
 	if err != nil {
-		return 0, fmt.Errorf("native: invalid device: %w", err)
+		return 0, fmt.Errorf("gpu: invalid device: %w", err)
 	}
 
 	halLayout, err := b.registry.GetBindGroupLayout(desc.Layout)
 	if err != nil {
-		return 0, fmt.Errorf("native: invalid bind group layout: %w", err)
+		return 0, fmt.Errorf("gpu: invalid bind group layout: %w", err)
 	}
 
-	// Convert entries - need to resolve handles to native handles
+	// Convert entries - need to resolve handles to gpu handles
 	halEntries := make([]gputypes.BindGroupEntry, len(desc.Entries))
 	for i, entry := range desc.Entries {
 		halEntries[i] = gputypes.BindGroupEntry{
@@ -753,7 +786,7 @@ func (b *Backend) CreateBindGroup(device types.Device, desc *types.BindGroupDesc
 		case entry.Buffer != 0:
 			halBuffer, bufErr := b.registry.GetBuffer(entry.Buffer)
 			if bufErr != nil {
-				return 0, fmt.Errorf("native: invalid buffer in bind group entry %d: %w", i, bufErr)
+				return 0, fmt.Errorf("gpu: invalid buffer in bind group entry %d: %w", i, bufErr)
 			}
 			halEntries[i].Resource = gputypes.BufferBinding{
 				Buffer: halBuffer.NativeHandle(),
@@ -763,7 +796,7 @@ func (b *Backend) CreateBindGroup(device types.Device, desc *types.BindGroupDesc
 		case entry.Sampler != 0:
 			halSampler, sampErr := b.registry.GetSampler(entry.Sampler)
 			if sampErr != nil {
-				return 0, fmt.Errorf("native: invalid sampler in bind group entry %d: %w", i, sampErr)
+				return 0, fmt.Errorf("gpu: invalid sampler in bind group entry %d: %w", i, sampErr)
 			}
 			halEntries[i].Resource = gputypes.SamplerBinding{
 				Sampler: halSampler.NativeHandle(),
@@ -771,13 +804,13 @@ func (b *Backend) CreateBindGroup(device types.Device, desc *types.BindGroupDesc
 		case entry.TextureView != 0:
 			halView, viewErr := b.registry.GetTextureView(entry.TextureView)
 			if viewErr != nil {
-				return 0, fmt.Errorf("native: invalid texture view in bind group entry %d: %w", i, viewErr)
+				return 0, fmt.Errorf("gpu: invalid texture view in bind group entry %d: %w", i, viewErr)
 			}
 			halEntries[i].Resource = gputypes.TextureViewBinding{
 				TextureView: halView.NativeHandle(),
 			}
 		default:
-			return 0, fmt.Errorf("native: bind group entry %d has no resource", i)
+			return 0, fmt.Errorf("gpu: bind group entry %d has no resource", i)
 		}
 	}
 
@@ -789,17 +822,18 @@ func (b *Backend) CreateBindGroup(device types.Device, desc *types.BindGroupDesc
 
 	group, err := halDevice.CreateBindGroup(halDesc)
 	if err != nil {
-		return 0, fmt.Errorf("native: failed to create bind group: %w", err)
+		return 0, fmt.Errorf("gpu: failed to create bind group: %w", err)
 	}
 
 	handle := b.registry.RegisterBindGroup(group)
 	return handle, nil
 }
 
+// CreatePipelineLayout creates a pipeline layout.
 func (b *Backend) CreatePipelineLayout(device types.Device, desc *types.PipelineLayoutDescriptor) (types.PipelineLayout, error) {
 	halDevice, err := b.registry.GetDevice(device)
 	if err != nil {
-		return 0, fmt.Errorf("native: invalid device: %w", err)
+		return 0, fmt.Errorf("gpu: invalid device: %w", err)
 	}
 
 	// Convert bind group layouts
@@ -807,7 +841,7 @@ func (b *Backend) CreatePipelineLayout(device types.Device, desc *types.Pipeline
 	for i, layout := range desc.BindGroupLayouts {
 		halLayout, layoutErr := b.registry.GetBindGroupLayout(layout)
 		if layoutErr != nil {
-			return 0, fmt.Errorf("native: invalid bind group layout at index %d: %w", i, layoutErr)
+			return 0, fmt.Errorf("gpu: invalid bind group layout at index %d: %w", i, layoutErr)
 		}
 		halLayouts[i] = halLayout
 	}
@@ -819,13 +853,14 @@ func (b *Backend) CreatePipelineLayout(device types.Device, desc *types.Pipeline
 
 	layout, err := halDevice.CreatePipelineLayout(halDesc)
 	if err != nil {
-		return 0, fmt.Errorf("native: failed to create pipeline layout: %w", err)
+		return 0, fmt.Errorf("gpu: failed to create pipeline layout: %w", err)
 	}
 
 	handle := b.registry.RegisterPipelineLayout(layout)
 	return handle, nil
 }
 
+// SetBindGroup sets a bind group for a render pass.
 func (b *Backend) SetBindGroup(pass types.RenderPass, index uint32, bindGroup types.BindGroup, dynamicOffsets []uint32) {
 	halPass, err := b.registry.GetRenderPass(pass)
 	if err != nil {
@@ -840,67 +875,185 @@ func (b *Backend) SetBindGroup(pass types.RenderPass, index uint32, bindGroup ty
 	halPass.SetBindGroup(index, halGroup, dynamicOffsets)
 }
 
+// SetVertexBuffer sets a vertex buffer for a render pass.
 func (b *Backend) SetVertexBuffer(pass types.RenderPass, slot uint32, buffer types.Buffer, offset, size uint64) {
 	// Not implemented yet
 }
 
+// SetIndexBuffer sets an index buffer for a render pass.
 func (b *Backend) SetIndexBuffer(pass types.RenderPass, buffer types.Buffer, format gputypes.IndexFormat, offset, size uint64) {
 	// Not implemented yet
 }
 
+// DrawIndexed issues an indexed draw call.
 func (b *Backend) DrawIndexed(pass types.RenderPass, indexCount, instanceCount, firstIndex uint32, baseVertex int32, firstInstance uint32) {
 	// Not implemented yet
 }
 
-// --- Compute shader operations (stubs) ---
+// --- Compute shader operations ---
 
 // CreateShaderModuleSPIRV creates a shader module from SPIR-V bytecode.
 func (b *Backend) CreateShaderModuleSPIRV(device types.Device, spirv []uint32) (types.ShaderModule, error) {
-	return 0, gpu.ErrNotImplemented
+	halDevice, err := b.registry.GetDevice(device)
+	if err != nil {
+		return 0, err
+	}
+
+	desc := &hal.ShaderModuleDescriptor{
+		Label:  "shader-spirv",
+		Source: hal.ShaderSource{SPIRV: spirv},
+	}
+
+	module, err := halDevice.CreateShaderModule(desc)
+	if err != nil {
+		return 0, fmt.Errorf("gpu: failed to create SPIR-V shader module: %w", err)
+	}
+
+	handle := b.registry.RegisterShaderModule(module)
+	return handle, nil
 }
 
 // CreateComputePipeline creates a compute pipeline.
 func (b *Backend) CreateComputePipeline(device types.Device, desc *types.ComputePipelineDescriptor) (types.ComputePipeline, error) {
-	return 0, gpu.ErrNotImplemented
+	halDevice, err := b.registry.GetDevice(device)
+	if err != nil {
+		return 0, err
+	}
+
+	// Get shader module
+	halModule, err := b.registry.GetShaderModule(desc.Module)
+	if err != nil {
+		return 0, fmt.Errorf("gpu: invalid compute shader module: %w", err)
+	}
+
+	// Get pipeline layout if provided
+	var halLayout hal.PipelineLayout
+	if desc.Layout != 0 {
+		halLayout, err = b.registry.GetPipelineLayout(desc.Layout)
+		if err != nil {
+			return 0, fmt.Errorf("gpu: invalid pipeline layout: %w", err)
+		}
+	}
+
+	halDesc := &hal.ComputePipelineDescriptor{
+		Label:  desc.Label,
+		Layout: halLayout,
+		Compute: hal.ComputeState{
+			Module:     halModule,
+			EntryPoint: desc.EntryPoint,
+		},
+	}
+
+	pipeline, err := halDevice.CreateComputePipeline(halDesc)
+	if err != nil {
+		return 0, fmt.Errorf("gpu: failed to create compute pipeline: %w", err)
+	}
+
+	handle := b.registry.RegisterComputePipeline(pipeline)
+	return handle, nil
 }
 
 // BeginComputePass begins a compute pass.
 func (b *Backend) BeginComputePass(encoder types.CommandEncoder) types.ComputePass {
-	return 0
+	halEncoder, err := b.registry.GetCommandEncoder(encoder)
+	if err != nil {
+		return 0
+	}
+
+	halDesc := &hal.ComputePassDescriptor{
+		Label: "compute_pass",
+	}
+
+	pass := halEncoder.BeginComputePass(halDesc)
+
+	handle := b.registry.RegisterComputePass(pass)
+	return handle
 }
 
 // EndComputePass ends a compute pass.
 func (b *Backend) EndComputePass(pass types.ComputePass) {
-	// Not implemented yet
+	halPass, err := b.registry.GetComputePass(pass)
+	if err != nil {
+		return
+	}
+
+	halPass.End()
 }
 
 // SetComputePipeline sets the compute pipeline for a compute pass.
 func (b *Backend) SetComputePipeline(pass types.ComputePass, pipeline types.ComputePipeline) {
-	// Not implemented yet
+	halPass, err := b.registry.GetComputePass(pass)
+	if err != nil {
+		return
+	}
+
+	halPipeline, err := b.registry.GetComputePipeline(pipeline)
+	if err != nil {
+		return
+	}
+
+	halPass.SetPipeline(halPipeline)
 }
 
 // SetComputeBindGroup sets a bind group for a compute pass.
 func (b *Backend) SetComputeBindGroup(pass types.ComputePass, index uint32, bindGroup types.BindGroup, dynamicOffsets []uint32) {
-	// Not implemented yet
+	halPass, err := b.registry.GetComputePass(pass)
+	if err != nil {
+		return
+	}
+
+	halGroup, err := b.registry.GetBindGroup(bindGroup)
+	if err != nil {
+		return
+	}
+
+	halPass.SetBindGroup(index, halGroup, dynamicOffsets)
 }
 
 // DispatchWorkgroups dispatches compute work.
 func (b *Backend) DispatchWorkgroups(pass types.ComputePass, x, y, z uint32) {
-	// Not implemented yet
+	halPass, err := b.registry.GetComputePass(pass)
+	if err != nil {
+		return
+	}
+
+	halPass.Dispatch(x, y, z)
 }
 
-// MapBufferRead maps a buffer for reading and returns its contents.
+// MapBufferRead reads a buffer's contents from the GPU.
+// The buffer must have been created with BufferUsageMapRead | BufferUsageCopyDst.
 func (b *Backend) MapBufferRead(buffer types.Buffer) ([]byte, error) {
-	return nil, gpu.ErrNotImplemented
+	halBuffer, err := b.registry.GetBuffer(buffer)
+	if err != nil {
+		return nil, fmt.Errorf("gpu: invalid buffer: %w", err)
+	}
+
+	size, ok := b.bufferSizes[buffer]
+	if !ok {
+		return nil, fmt.Errorf("gpu: unknown buffer size for handle %d", buffer)
+	}
+
+	halQueue := b.registry.GetAnyQueue()
+	if halQueue == nil {
+		return nil, fmt.Errorf("gpu: no queue available for ReadBuffer")
+	}
+
+	data := make([]byte, size)
+	if err := halQueue.ReadBuffer(halBuffer, 0, data); err != nil {
+		return nil, fmt.Errorf("gpu: ReadBuffer failed: %w", err)
+	}
+	return data, nil
 }
 
-// UnmapBuffer unmaps a previously mapped buffer.
+// UnmapBuffer is a no-op for the native backend.
+// ReadBuffer returns a copy of the data, so no unmapping is needed.
 func (b *Backend) UnmapBuffer(buffer types.Buffer) {
-	// Not implemented yet
+	// No-op: ReadBuffer copies data, no persistent mapping to release.
 }
 
 // --- Resource release ---
 
+// ReleaseTexture releases a texture.
 func (b *Backend) ReleaseTexture(texture types.Texture) {
 	halTexture, err := b.registry.GetTexture(texture)
 	if err == nil && halTexture != nil {
@@ -909,6 +1062,7 @@ func (b *Backend) ReleaseTexture(texture types.Texture) {
 	b.registry.UnregisterTexture(texture)
 }
 
+// ReleaseTextureView releases a texture view.
 func (b *Backend) ReleaseTextureView(view types.TextureView) {
 	halView, err := b.registry.GetTextureView(view)
 	if err == nil && halView != nil {
@@ -917,6 +1071,7 @@ func (b *Backend) ReleaseTextureView(view types.TextureView) {
 	b.registry.UnregisterTextureView(view)
 }
 
+// ReleaseSampler releases a sampler.
 func (b *Backend) ReleaseSampler(sampler types.Sampler) {
 	halSampler, err := b.registry.GetSampler(sampler)
 	if err == nil && halSampler != nil {
@@ -925,14 +1080,17 @@ func (b *Backend) ReleaseSampler(sampler types.Sampler) {
 	b.registry.UnregisterSampler(sampler)
 }
 
+// ReleaseBuffer releases a buffer.
 func (b *Backend) ReleaseBuffer(buffer types.Buffer) {
 	halBuffer, err := b.registry.GetBuffer(buffer)
 	if err == nil && halBuffer != nil {
 		halBuffer.Destroy()
 	}
 	b.registry.UnregisterBuffer(buffer)
+	delete(b.bufferSizes, buffer)
 }
 
+// ReleaseBindGroupLayout releases a bind group layout.
 func (b *Backend) ReleaseBindGroupLayout(layout types.BindGroupLayout) {
 	halLayout, err := b.registry.GetBindGroupLayout(layout)
 	if err == nil && halLayout != nil {
@@ -941,6 +1099,7 @@ func (b *Backend) ReleaseBindGroupLayout(layout types.BindGroupLayout) {
 	b.registry.UnregisterBindGroupLayout(layout)
 }
 
+// ReleaseBindGroup releases a bind group.
 func (b *Backend) ReleaseBindGroup(group types.BindGroup) {
 	halGroup, err := b.registry.GetBindGroup(group)
 	if err == nil && halGroup != nil {
@@ -949,6 +1108,7 @@ func (b *Backend) ReleaseBindGroup(group types.BindGroup) {
 	b.registry.UnregisterBindGroup(group)
 }
 
+// ReleasePipelineLayout releases a pipeline layout.
 func (b *Backend) ReleasePipelineLayout(layout types.PipelineLayout) {
 	halLayout, err := b.registry.GetPipelineLayout(layout)
 	if err == nil && halLayout != nil {
@@ -957,6 +1117,7 @@ func (b *Backend) ReleasePipelineLayout(layout types.PipelineLayout) {
 	b.registry.UnregisterPipelineLayout(layout)
 }
 
+// ReleaseCommandBuffer releases a command buffer.
 func (b *Backend) ReleaseCommandBuffer(buffer types.CommandBuffer) {
 	halBuffer, err := b.registry.GetCommandBuffer(buffer)
 	if err == nil && halBuffer != nil {
@@ -972,12 +1133,14 @@ func (b *Backend) ReleaseCommandBuffer(buffer types.CommandBuffer) {
 	b.registry.UnregisterCommandBuffer(buffer)
 }
 
+// ReleaseCommandEncoder releases a command encoder.
 func (b *Backend) ReleaseCommandEncoder(encoder types.CommandEncoder) {
 	// Command encoders don't have Destroy in HAL - they're consumed when EndEncoding() is called.
 	// We just unregister the handle from the registry.
 	b.registry.UnregisterCommandEncoder(encoder)
 }
 
+// ReleaseRenderPass releases a render pass.
 func (b *Backend) ReleaseRenderPass(pass types.RenderPass) {
 	// Render passes are ended, not destroyed
 	b.registry.UnregisterRenderPass(pass)
@@ -985,12 +1148,17 @@ func (b *Backend) ReleaseRenderPass(pass types.RenderPass) {
 
 // ReleaseComputePipeline releases a compute pipeline.
 func (b *Backend) ReleaseComputePipeline(pipeline types.ComputePipeline) {
-	// Not implemented yet
+	halPipeline, err := b.registry.GetComputePipeline(pipeline)
+	if err == nil && halPipeline != nil {
+		halPipeline.Destroy()
+	}
+	b.registry.UnregisterComputePipeline(pipeline)
 }
 
 // ReleaseComputePass releases a compute pass.
 func (b *Backend) ReleaseComputePass(pass types.ComputePass) {
-	// Not implemented yet
+	// Compute passes are ended, not destroyed
+	b.registry.UnregisterComputePass(pass)
 }
 
 // ReleaseShaderModule releases a shader module.
@@ -1010,7 +1178,7 @@ func (b *Backend) ResetCommandPool(device types.Device) {
 		return
 	}
 
-	// Type assert to vulkan.Device to access ResetCommandPool
+	// Type assert to access ResetCommandPool (available on backends that support it)
 	type commandPoolResetter interface {
 		WaitIdle() error
 		ResetCommandPool() error
@@ -1027,12 +1195,12 @@ func (b *Backend) ResetCommandPool(device types.Device) {
 func (b *Backend) CreateFence(device types.Device) (types.Fence, error) {
 	halDevice, err := b.registry.GetDevice(device)
 	if err != nil {
-		return 0, fmt.Errorf("native: invalid device: %w", err)
+		return 0, fmt.Errorf("gpu: invalid device: %w", err)
 	}
 
 	halFence, err := halDevice.CreateFence()
 	if err != nil {
-		return 0, fmt.Errorf("native: failed to create fence: %w", err)
+		return 0, fmt.Errorf("gpu: failed to create fence: %w", err)
 	}
 
 	handle := b.registry.RegisterFence(halFence, device)
@@ -1043,12 +1211,12 @@ func (b *Backend) CreateFence(device types.Device) (types.Fence, error) {
 func (b *Backend) WaitFence(device types.Device, fence types.Fence, timeout uint64) (bool, error) {
 	halDevice, err := b.registry.GetDevice(device)
 	if err != nil {
-		return false, fmt.Errorf("native: invalid device: %w", err)
+		return false, fmt.Errorf("gpu: invalid device: %w", err)
 	}
 
 	halFence, err := b.registry.GetFence(fence)
 	if err != nil {
-		return false, fmt.Errorf("native: invalid fence: %w", err)
+		return false, fmt.Errorf("gpu: invalid fence: %w", err)
 	}
 
 	// Convert timeout from nanoseconds to time.Duration.
@@ -1060,12 +1228,12 @@ func (b *Backend) WaitFence(device types.Device, fence types.Fence, timeout uint
 func (b *Backend) ResetFence(device types.Device, fence types.Fence) error {
 	halDevice, err := b.registry.GetDevice(device)
 	if err != nil {
-		return fmt.Errorf("native: invalid device: %w", err)
+		return fmt.Errorf("gpu: invalid device: %w", err)
 	}
 
 	halFence, err := b.registry.GetFence(fence)
 	if err != nil {
-		return fmt.Errorf("native: invalid fence: %w", err)
+		return fmt.Errorf("gpu: invalid fence: %w", err)
 	}
 
 	return halDevice.ResetFence(halFence)
@@ -1085,6 +1253,24 @@ func (b *Backend) DestroyFence(device types.Device, fence types.Fence) {
 
 	halDevice.DestroyFence(halFence)
 	b.registry.UnregisterFence(fence)
+}
+
+// GetHalDevice returns the underlying HAL device for the given handle.
+func (b *Backend) GetHalDevice(device types.Device) any {
+	dev, err := b.registry.GetDevice(device)
+	if err != nil {
+		return nil
+	}
+	return dev
+}
+
+// GetHalQueue returns the underlying HAL queue for the given handle.
+func (b *Backend) GetHalQueue(queue types.Queue) any {
+	q, err := b.registry.GetQueue(queue)
+	if err != nil {
+		return nil
+	}
+	return q
 }
 
 // Ensure Backend implements gpu.Backend.

@@ -92,7 +92,7 @@ GoGPU supports two WebGPU implementations, selectable at compile time or runtime
 # Pure Go backend (default, zero dependencies)
 go build ./...
 
-# Enable Rust backend (requires wgpu-native DLL, Windows only)
+# Enable Rust backend (requires wgpu-gpu DLL, Windows only)
 go build -tags rust ./...
 ```
 
@@ -145,7 +145,7 @@ GoGPU exposes GPU resources through the `DeviceProvider` interface for integrati
 
 ```go
 type DeviceProvider interface {
-    Backend() gpu.Backend        // GPU backend (rust or native)
+    Backend() gpu.Backend        // GPU backend (rust or gpu)
     Device() types.Device        // GPU device handle
     Queue() types.Queue          // Command queue
     SurfaceFormat() types.TextureFormat
@@ -181,6 +181,24 @@ events.OnMousePress(func(button gpucontext.MouseButton, x, y float64) {
 ```
 
 This enables enterprise-grade dependency injection between packages without circular imports.
+
+### HalProvider (Direct GPU Access)
+
+For GPU accelerators that need low-level HAL access (compute shaders, buffer readback):
+
+```go
+import "github.com/gogpu/gpucontext"
+
+provider := app.GPUContextProvider()
+
+// Type-assert to HalProvider for direct HAL access
+if hp, ok := provider.(gpucontext.HalProvider); ok {
+    halDevice := hp.HalDevice() // hal.Device for compute pipelines
+    halQueue := hp.HalQueue()   // hal.Queue for command submission
+}
+```
+
+Used by [gogpu/gg](https://github.com/gogpu/gg) GPU SDF accelerator for compute shader dispatch on shared device.
 
 ### Window & Platform Integration
 
