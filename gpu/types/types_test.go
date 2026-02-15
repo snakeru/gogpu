@@ -43,134 +43,47 @@ func TestBackendTypeValues(t *testing.T) {
 	}
 }
 
-func TestSurfaceStatusValues(t *testing.T) {
-	// Verify iota ordering
-	if SurfaceStatusSuccess != 0 {
-		t.Errorf("SurfaceStatusSuccess = %d, want 0", SurfaceStatusSuccess)
+func TestGraphicsAPIString(t *testing.T) {
+	tests := []struct {
+		api      GraphicsAPI
+		expected string
+	}{
+		{GraphicsAPIAuto, "Auto"},
+		{GraphicsAPIVulkan, "Vulkan"},
+		{GraphicsAPIDX12, "DX12"},
+		{GraphicsAPIMetal, "Metal"},
+		{GraphicsAPIGLES, "GLES"},
+		{GraphicsAPISoftware, "Software"},
+		{GraphicsAPI(99), "Auto"}, // Unknown defaults to Auto
 	}
-	if SurfaceStatusTimeout != 1 {
-		t.Errorf("SurfaceStatusTimeout = %d, want 1", SurfaceStatusTimeout)
-	}
-	if SurfaceStatusOutdated != 2 {
-		t.Errorf("SurfaceStatusOutdated = %d, want 2", SurfaceStatusOutdated)
-	}
-	if SurfaceStatusLost != 3 {
-		t.Errorf("SurfaceStatusLost = %d, want 3", SurfaceStatusLost)
-	}
-	if SurfaceStatusError != 4 {
-		t.Errorf("SurfaceStatusError = %d, want 4", SurfaceStatusError)
+
+	for _, tt := range tests {
+		t.Run(tt.expected, func(t *testing.T) {
+			got := tt.api.String()
+			if got != tt.expected {
+				t.Errorf("GraphicsAPI(%d).String() = %q, want %q", tt.api, got, tt.expected)
+			}
+		})
 	}
 }
 
-func TestSurfaceTexture(t *testing.T) {
-	st := SurfaceTexture{
-		Texture: Texture(42),
-		Status:  SurfaceStatusSuccess,
+func TestGraphicsAPIValues(t *testing.T) {
+	if GraphicsAPIAuto != 0 {
+		t.Errorf("GraphicsAPIAuto = %d, want 0", GraphicsAPIAuto)
 	}
-
-	if st.Texture != 42 {
-		t.Errorf("SurfaceTexture.Texture = %d, want 42", st.Texture)
+	if GraphicsAPIVulkan != 1 {
+		t.Errorf("GraphicsAPIVulkan = %d, want 1", GraphicsAPIVulkan)
 	}
-	if st.Status != SurfaceStatusSuccess {
-		t.Errorf("SurfaceTexture.Status = %d, want %d", st.Status, SurfaceStatusSuccess)
+	if GraphicsAPIDX12 != 2 {
+		t.Errorf("GraphicsAPIDX12 = %d, want 2", GraphicsAPIDX12)
 	}
-}
-
-func TestSurfaceHandle(t *testing.T) {
-	sh := SurfaceHandle{
-		Instance: 0x1234,
-		Window:   0x5678,
+	if GraphicsAPIMetal != 3 {
+		t.Errorf("GraphicsAPIMetal = %d, want 3", GraphicsAPIMetal)
 	}
-
-	if sh.Instance != 0x1234 {
-		t.Errorf("SurfaceHandle.Instance = 0x%x, want 0x1234", sh.Instance)
+	if GraphicsAPIGLES != 4 {
+		t.Errorf("GraphicsAPIGLES = %d, want 4", GraphicsAPIGLES)
 	}
-	if sh.Window != 0x5678 {
-		t.Errorf("SurfaceHandle.Window = 0x%x, want 0x5678", sh.Window)
-	}
-}
-
-func TestNewHandleTypes(t *testing.T) {
-	// Test new handle types added for texture support
-	var (
-		buffer          Buffer          = 1
-		sampler         Sampler         = 2
-		bindGroupLayout BindGroupLayout = 3
-		bindGroup       BindGroup       = 4
-		pipelineLayout  PipelineLayout  = 5
-	)
-
-	handles := []uintptr{
-		uintptr(buffer),
-		uintptr(sampler),
-		uintptr(bindGroupLayout),
-		uintptr(bindGroup),
-		uintptr(pipelineLayout),
-	}
-
-	for i, h := range handles {
-		expected := uintptr(i + 1)
-		if h != expected {
-			t.Errorf("New Handle[%d] = %d, want %d", i, h, expected)
-		}
-	}
-}
-
-func TestHandleTypes(t *testing.T) {
-	// Verify handles are distinct types (compile-time check via assignments)
-	var (
-		instance       Instance       = 1
-		adapter        Adapter        = 2
-		device         Device         = 3
-		queue          Queue          = 4
-		surface        Surface        = 5
-		texture        Texture        = 6
-		textureView    TextureView    = 7
-		shaderModule   ShaderModule   = 8
-		renderPipeline RenderPipeline = 9
-		commandEncoder CommandEncoder = 10
-		commandBuffer  CommandBuffer  = 11
-		renderPass     RenderPass     = 12
-	)
-
-	// Verify they hold correct values
-	handles := []uintptr{
-		uintptr(instance),
-		uintptr(adapter),
-		uintptr(device),
-		uintptr(queue),
-		uintptr(surface),
-		uintptr(texture),
-		uintptr(textureView),
-		uintptr(shaderModule),
-		uintptr(renderPipeline),
-		uintptr(commandEncoder),
-		uintptr(commandBuffer),
-		uintptr(renderPass),
-	}
-
-	for i, h := range handles {
-		expected := uintptr(i + 1)
-		if h != expected {
-			t.Errorf("Handle[%d] = %d, want %d", i, h, expected)
-		}
-	}
-}
-
-func TestImageDataLayout(t *testing.T) {
-	layout := ImageDataLayout{
-		Offset:       0,
-		BytesPerRow:  512 * 4, // 512 pixels * 4 bytes (RGBA)
-		RowsPerImage: 256,
-	}
-
-	if layout.Offset != 0 {
-		t.Errorf("ImageDataLayout.Offset = %d, want 0", layout.Offset)
-	}
-	if layout.BytesPerRow != 2048 {
-		t.Errorf("ImageDataLayout.BytesPerRow = %d, want 2048", layout.BytesPerRow)
-	}
-	if layout.RowsPerImage != 256 {
-		t.Errorf("ImageDataLayout.RowsPerImage = %d, want 256", layout.RowsPerImage)
+	if GraphicsAPISoftware != 5 {
+		t.Errorf("GraphicsAPISoftware = %d, want 5", GraphicsAPISoftware)
 	}
 }

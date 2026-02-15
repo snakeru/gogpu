@@ -31,10 +31,12 @@
 | Category | Capabilities |
 |----------|--------------|
 | **Backends** | Rust (wgpu-native) or Pure Go (gogpu/wgpu) |
-| **Platforms** | Windows (Vulkan/DX12), Linux (Vulkan), macOS (Metal) |
-| **Graphics** | Windowing, input handling, texture loading |
+| **Graphics API** | Runtime selection: Vulkan, DX12, Metal, GLES, Software |
+| **Platforms** | Windows (Vulkan/DX12/GLES), Linux (Vulkan/GLES), macOS (Metal) |
+| **Graphics** | Windowing, input handling, texture loading, zero-copy surface rendering |
 | **Compute** | Full compute shader support |
-| **Integration** | DeviceProvider, WindowProvider, PlatformProvider for external libraries |
+| **Integration** | DeviceProvider, HalProvider, WindowProvider, PlatformProvider, SurfaceView |
+| **Logging** | Structured logging via `log/slog`, silent by default |
 | **Build** | Zero CGO with Pure Go backend |
 
 ---
@@ -116,6 +118,33 @@ app := gogpu.NewApp(gogpu.DefaultConfig().WithBackend(gogpu.BackendGo))
 
 > **Note:** Rust backend requires [wgpu-native](https://github.com/gfx-rs/wgpu-native/releases) DLL.
 
+### Graphics API Selection
+
+Backend (Rust/Native) and Graphics API (Vulkan/DX12/Metal/GLES) are independent choices:
+
+```go
+// Force Vulkan on Windows (instead of auto-detected default)
+app := gogpu.NewApp(gogpu.DefaultConfig().
+    WithGraphicsAPI(gogpu.GraphicsAPIVulkan))
+
+// Force DirectX 12 on Windows
+app := gogpu.NewApp(gogpu.DefaultConfig().
+    WithGraphicsAPI(gogpu.GraphicsAPIDX12))
+
+// Force GLES (useful for testing or compatibility)
+app := gogpu.NewApp(gogpu.DefaultConfig().
+    WithGraphicsAPI(gogpu.GraphicsAPIGLES))
+```
+
+| Graphics API | Platforms | Constant |
+|--------------|-----------|----------|
+| **Auto** | All (default) | `gogpu.GraphicsAPIAuto` |
+| **Vulkan** | Windows, Linux | `gogpu.GraphicsAPIVulkan` |
+| **DX12** | Windows | `gogpu.GraphicsAPIDX12` |
+| **Metal** | macOS | `gogpu.GraphicsAPIMetal` |
+| **GLES** | Windows, Linux | `gogpu.GraphicsAPIGLES` |
+| **Software** | All | `gogpu.GraphicsAPISoftware` |
+
 ---
 
 ## Texture Loading
@@ -145,16 +174,15 @@ GoGPU exposes GPU resources through the `DeviceProvider` interface for integrati
 
 ```go
 type DeviceProvider interface {
-    Backend() gpu.Backend        // GPU backend (rust or gpu)
-    Device() types.Device        // GPU device handle
-    Queue() types.Queue          // Command queue
-    SurfaceFormat() types.TextureFormat
+    Device() hal.Device              // HAL GPU device (type-safe Go interface)
+    Queue() hal.Queue                // HAL command queue
+    SurfaceFormat() gputypes.TextureFormat
 }
 
 // Usage
 provider := app.DeviceProvider()
-device := provider.Device()
-queue := provider.Queue()
+device := provider.Device()   // hal.Device — 30+ methods with error returns
+queue := provider.Queue()     // hal.Queue — Submit, WriteBuffer, ReadBuffer
 ```
 
 ### Cross-Package Integration (gpucontext)
@@ -199,6 +227,19 @@ if hp, ok := provider.(gpucontext.HalProvider); ok {
 ```
 
 Used by [gogpu/gg](https://github.com/gogpu/gg) GPU SDF accelerator for compute shader dispatch on shared device.
+
+### SurfaceView (Zero-Copy Rendering)
+
+For direct GPU rendering without CPU readback:
+
+```go
+app.OnDraw(func(dc *gogpu.Context) {
+    view := dc.SurfaceView() // Current frame's GPU texture view
+    // Pass to ggcanvas.RenderDirect() for zero-copy compositing
+})
+```
+
+This eliminates the GPU→CPU→GPU round-trip when integrating with gg/ggcanvas.
 
 ### Window & Platform Integration
 
@@ -252,38 +293,79 @@ app.OnUpdate(func(dt float64) {
 
 All input methods are thread-safe and work with the frame-based update loop.
 
+### Resource Cleanup
+
+Use `OnClose` to release GPU resources before the renderer is destroyed:
+
+```go
+app.OnClose(func() {
+    if canvas != nil {
+        _ = canvas.Close()
+        canvas = nil
+    }
+})
+
+if err := app.Run(); err != nil {
+    log.Fatal(err)
+}
+```
+
+`OnClose` runs on the render thread before `Renderer.Destroy()`, ensuring textures, bind groups, and pipelines are released while the device is still alive.
+
 ---
 
 ## Compute Shaders
 
-Full compute shader support in both backends:
+Full compute shader support via HAL interfaces:
 
 ```go
-// Create compute pipeline via backend
-pipeline, _ := backend.CreateComputePipeline(device, &types.ComputePipelineDescriptor{
-    Layout: pipelineLayout,
-    Compute: types.ProgrammableStageDescriptor{
-        Module:     shaderModule,
-        EntryPoint: "main",
-    },
+// Create compute pipeline via HAL device
+pipeline, _ := device.CreateComputePipeline(&hal.ComputePipelineDescriptor{
+    Layout:     pipelineLayout,
+    Module:     shaderModule,
+    EntryPoint: "main",
 })
 
 // Create storage buffers
-inputBuffer, _ := backend.CreateBuffer(device, &types.BufferDescriptor{
+inputBuffer, _ := device.CreateBuffer(&hal.BufferDescriptor{
     Size:  dataSize,
-    Usage: types.BufferUsageStorage | types.BufferUsageCopyDst,
+    Usage: gputypes.BufferUsageStorage | gputypes.BufferUsageCopyDst,
 })
 
-outputBuffer, _ := backend.CreateBuffer(device, &types.BufferDescriptor{
-    Size:  dataSize,
-    Usage: types.BufferUsageStorage | types.BufferUsageCopySrc,
-})
-
-// Dispatch compute work
-computePass.SetPipeline(pipeline)
-computePass.SetBindGroup(0, bindGroup, nil)
-computePass.Dispatch(workgroupsX, 1, 1)
+// Dispatch compute work via command encoder
+encoder, _ := device.CreateCommandEncoder()
+encoder.BeginEncoding("compute")
+pass := encoder.BeginComputePass(&hal.ComputePassDescriptor{})
+pass.SetPipeline(pipeline)
+pass.SetBindGroup(0, bindGroup, nil)
+pass.Dispatch(workgroupsX, 1, 1)
+pass.End()
+cmdBuf := encoder.EndEncoding()
+queue.Submit([]hal.CommandBuffer{cmdBuf}, nil, 0)
 ```
+
+---
+
+## Logging
+
+GoGPU uses `log/slog` for structured logging, silent by default:
+
+```go
+import "log/slog"
+
+// Enable info-level logging
+gogpu.SetLogger(slog.Default())
+
+// Enable debug-level logging for full diagnostics
+gogpu.SetLogger(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+    Level: slog.LevelDebug,
+})))
+
+// Get current logger
+logger := gogpu.Logger()
+```
+
+Log levels: `Debug` (texture creation, pipeline state), `Info` (backend selected, adapter info), `Warn` (resource cleanup errors).
 
 ---
 
@@ -307,16 +389,20 @@ User Application
        ▼
 ┌─────────────────────────────────────────────────────────┐
 │                    gogpu.Renderer                       │
-│    Surface, Device, Queue, Frame Management             │
+│  Uses hal.Device / hal.Queue directly (Go interfaces)   │
 └─────────────────────────────────────────────────────────┘
        │
-       ├─────────────────┬─────────────────┐
-       ▼                 ▼                 ▼
-┌─────────────┐  ┌─────────────┐  ┌─────────────┐
-│   Rust      │  │  Native Go  │  │  Platform   │
-│   Backend   │  │   Backend   │  │  Windowing  │
-│ (wgpu-native)│ │ (gogpu/wgpu)│  │ Win32/Cocoa │
-└─────────────┘  └─────────────┘  └─────────────┘
+       ├─────────────────┐
+       ▼                 ▼
+┌─────────────┐  ┌─────────────┐
+│  gogpu/wgpu │  │  Platform   │
+│ (Pure Go    │  │  Windowing  │
+│  WebGPU)    │  │ Win32/Cocoa │
+└──────┬──────┘  └─────────────┘
+       │
+ ┌─────┴─────┬─────┬─────┬─────────┐
+ ▼           ▼     ▼     ▼         ▼
+Vulkan     DX12  Metal  GLES   Software
 ```
 
 ### Package Structure
@@ -324,10 +410,10 @@ User Application
 | Package | Purpose |
 |---------|---------|
 | `gogpu` (root) | App, Config, Context, Renderer, Texture |
-| `gpu/` | Backend interface, registry, auto-selection |
-| `gpu/types/` | GoGPU-specific types (handles, descriptors) |
-| `gpu/backend/rust/` | Rust backend via wgpu-native FFI |
-| `gpu/backend/native/` | Pure Go backend via gogpu/wgpu |
+| `gpu/` | Backend selection (HAL-based) |
+| `gpu/types/` | BackendType, GraphicsAPI enums |
+| `gpu/backend/rust/` | Rust backend via wgpu-native FFI (opt-in, `-tags rust`) |
+| `gpu/backend/native/` | HAL backend creation (Vulkan/Metal selection) |
 | `gmath/` | Vec2, Vec3, Vec4, Mat4, Color |
 | `window/` | Window configuration |
 | `input/` | Keyboard and mouse input |
