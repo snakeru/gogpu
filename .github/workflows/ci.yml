@@ -86,14 +86,26 @@ jobs:
       shell: bash
       run: racedetector test -v -coverprofile=coverage.txt -covermode=atomic ./...
 
+    - name: Verify coverage file
+      if: matrix.os == 'ubuntu-latest'
+      shell: bash
+      run: |
+        if [ -f coverage.txt ]; then
+          echo "coverage.txt found ($(wc -l < coverage.txt) lines)"
+        else
+          echo "coverage.txt not found, generating separately..."
+          go test -coverprofile=coverage.txt -covermode=atomic ./... || true
+        fi
+
     - name: Upload coverage to Codecov
       if: matrix.os == 'ubuntu-latest'
-      uses: codecov/codecov-action@v4
+      uses: codecov/codecov-action@v5
       with:
         token: ${{ secrets.CODECOV_TOKEN }}
-        file: ./coverage.txt
+        files: ./coverage.txt
         flags: unittests
         name: codecov-gogpu
+        fail_ci_if_error: true
 
   # Linting
   lint:
