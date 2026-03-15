@@ -2,7 +2,7 @@ package gogpu
 
 import (
 	"github.com/gogpu/gputypes"
-	"github.com/gogpu/wgpu/hal"
+	"github.com/gogpu/wgpu"
 )
 
 // DeviceProvider provides access to GPU resources for external libraries.
@@ -11,25 +11,12 @@ import (
 //
 // For cross-package integration (e.g., with gg), prefer using
 // gpucontext.DeviceProvider via App.GPUContextProvider().
-//
-// Example:
-//
-//	app := gogpu.NewApp(gogpu.Config{Title: "My App"})
-//	provider := app.DeviceProvider()
-//
-//	// Access GPU resources for custom rendering
-//	device := provider.Device()
-//	queue := provider.Queue()
-//	format := provider.SurfaceFormat()
-//
-// This pattern follows enterprise DI best practices, similar to
-// database/sql.DB or http.Client with custom Transport.
 type DeviceProvider interface {
-	// Device returns the HAL GPU device.
-	Device() hal.Device
+	// Device returns the wgpu GPU device.
+	Device() *wgpu.Device
 
-	// Queue returns the HAL GPU command queue.
-	Queue() hal.Queue
+	// Queue returns the wgpu GPU command queue.
+	Queue() *wgpu.Queue
 
 	// SurfaceFormat returns the preferred texture format for rendering.
 	SurfaceFormat() gputypes.TextureFormat
@@ -40,14 +27,17 @@ type rendererDeviceProvider struct {
 	renderer *Renderer
 }
 
-// Device returns the HAL GPU device.
-func (p *rendererDeviceProvider) Device() hal.Device {
+// Device returns the wgpu GPU device.
+func (p *rendererDeviceProvider) Device() *wgpu.Device {
 	return p.renderer.device
 }
 
-// Queue returns the HAL GPU command queue.
-func (p *rendererDeviceProvider) Queue() hal.Queue {
-	return p.renderer.queue
+// Queue returns the wgpu GPU command queue.
+func (p *rendererDeviceProvider) Queue() *wgpu.Queue {
+	if p.renderer.device == nil {
+		return nil
+	}
+	return p.renderer.device.Queue()
 }
 
 // SurfaceFormat returns the preferred texture format.

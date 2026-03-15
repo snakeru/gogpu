@@ -70,6 +70,7 @@ type waylandPlatform struct {
 	pointerCallback  func(gpucontext.PointerEvent)
 	scrollCallback   func(gpucontext.ScrollEvent)
 	keyboardCallback func(key gpucontext.Key, mods gpucontext.Modifiers, pressed bool)
+	charCallback     func(rune)
 	callbackMu       sync.RWMutex
 }
 
@@ -198,6 +199,12 @@ func (p *x11Platform) SetScrollCallback(fn func(gpucontext.ScrollEvent)) {
 // SetKeyCallback registers a callback for keyboard events.
 func (p *x11Platform) SetKeyCallback(fn func(key gpucontext.Key, mods gpucontext.Modifiers, pressed bool)) {
 	p.inner.SetKeyCallback(fn)
+}
+
+// SetCharCallback registers a callback for Unicode character input.
+// TODO: Implement via libxkbcommon xkb_state_key_get_utf8 for full Unicode support.
+func (p *x11Platform) SetCharCallback(fn func(rune)) {
+	p.inner.SetCharCallback(fn)
 }
 
 // SetModalFrameCallback is a no-op on X11.
@@ -1514,6 +1521,14 @@ func (p *waylandPlatform) SetKeyCallback(fn func(key gpucontext.Key, mods gpucon
 	p.callbackMu.Unlock()
 }
 
+// SetCharCallback registers a callback for Unicode character input.
+// TODO: Implement via libxkbcommon xkb_state_key_get_utf8 for full Unicode support.
+func (p *waylandPlatform) SetCharCallback(fn func(rune)) {
+	p.callbackMu.Lock()
+	p.charCallback = fn
+	p.callbackMu.Unlock()
+}
+
 // SetModalFrameCallback is a no-op on Wayland.
 // Wayland uses async configure events — resize is never blocking.
 func (p *waylandPlatform) SetModalFrameCallback(_ func()) {}
@@ -1562,6 +1577,17 @@ func drainPipe(fd int) {
 // TODO: Implement using wl_output scale and fractional_scale_v1.
 func (p *waylandPlatform) ScaleFactor() float64 { return 1.0 }
 
+// PrepareFrame returns current scale/size state for the Wayland platform.
+// Future: apply pending wl_output.scale here.
+func (p *waylandPlatform) PrepareFrame() PrepareFrameResult {
+	w, h := p.PhysicalSize()
+	return PrepareFrameResult{
+		ScaleFactor:    p.ScaleFactor(),
+		PhysicalWidth:  uint32(w),
+		PhysicalHeight: uint32(h),
+	}
+}
+
 // ClipboardRead reads text from the system clipboard.
 // TODO: Implement using wl_data_device and wl_data_offer.
 func (p *waylandPlatform) ClipboardRead() (string, error) { return "", nil }
@@ -1595,6 +1621,17 @@ func (p *waylandPlatform) FontScale() float32 { return 1.0 }
 // ScaleFactor returns the DPI scale factor.
 // TODO: Implement using Xft.dpi or XRandR.
 func (p *x11Platform) ScaleFactor() float64 { return 1.0 }
+
+// PrepareFrame returns current scale/size state for the X11 platform.
+// X11 has static DPI — no per-frame updates needed.
+func (p *x11Platform) PrepareFrame() PrepareFrameResult {
+	w, h := p.PhysicalSize()
+	return PrepareFrameResult{
+		ScaleFactor:    p.ScaleFactor(),
+		PhysicalWidth:  uint32(w),
+		PhysicalHeight: uint32(h),
+	}
+}
 
 // ClipboardRead reads text from the system clipboard.
 // TODO: Implement using X11 selections (XA_CLIPBOARD).

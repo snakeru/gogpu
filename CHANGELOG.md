@@ -5,6 +5,55 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.24.0] - 2026-03-15
+
+### Added
+
+- **Platform: SetCharCallback for Unicode text input** — New `Platform.SetCharCallback(func(rune))`
+  interface method, wired to `OnTextInput()` callback in app.go. Enables non-Latin text input
+  (Cyrillic, CJK, Arabic, etc.) in UI widgets.
+  - **Windows:** Full implementation with WM_CHAR + WM_SYSCHAR (AltGr) + WM_UNICHAR (IME),
+    UTF-16 surrogate pair decoding for emoji/supplementary characters (GLFW/Ebiten pattern)
+  - **macOS:** Basic implementation via `[NSEvent characters]` UTF-8 extraction
+  - **Linux (X11/Wayland):** Callback infrastructure in place, full implementation
+    requires libxkbcommon integration (planned)
+  - Fixes [#138](https://github.com/gogpu/gogpu/issues/138)
+
+### Changed
+
+- **Renderer migrated from HAL direct to wgpu public API** — The renderer now uses
+  `*wgpu.Device`, `*wgpu.Surface`, `*wgpu.Queue` instead of `hal.Device`, `hal.Surface`,
+  `hal.Queue` directly. All GPU operations go through the wgpu public API → wgpu/core →
+  wgpu/hal chain. This enables proper surface lifecycle management, PrepareFrame hooks
+  for HiDPI/DPI handling, and validation at the core layer. Both native (Pure Go) and
+  Rust (FFI) backends continue to work through the unified `gpu.Backend` interface.
+
+- **FencePool migrated to wgpu types** — Uses `*wgpu.Device`, `*wgpu.Fence`,
+  `*wgpu.CommandBuffer` instead of hal types. Non-blocking async submission through
+  `Queue.SubmitWithFence()`.
+
+- **Texture migrated to wgpu types** — Uses `*wgpu.Texture`, `*wgpu.TextureView`,
+  `*wgpu.Sampler`. Resource cleanup through `Release()` pattern instead of
+  `device.Destroy*()`.
+
+- **Native backend creates wgpu objects** — `gpu/backend/native/` now creates
+  `*wgpu.Instance` → `*wgpu.Adapter` → `*wgpu.Device` instead of hal objects directly.
+
+- **Context.SurfaceView() returns `*wgpu.TextureView`** — Was `any`, now typed.
+
+### Fixed
+
+- **Rust backend: WriteBuffer/WriteTexture return type** — go-webgpu changed
+  these methods to void return. Adapted wrapper to match.
+
+### Dependencies
+
+- wgpu v0.20.2 → v0.21.0 (three-layer public API, proper type definitions)
+- gpucontext v0.9.0 → v0.10.0 (typed interfaces, HalProvider removed)
+- naga v0.14.6 → v0.14.7 (MSL binding index fix)
+
 ## [0.23.3] - 2026-03-12
 
 ### Fixed

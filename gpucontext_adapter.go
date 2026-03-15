@@ -10,26 +10,35 @@ import (
 // gpuContextAdapter bridges gogpu to gpucontext.DeviceProvider interface.
 // This allows external libraries (like gg) to use gogpu's GPU resources
 // through the standard gpucontext interface.
+//
+// Device() and Queue() return the actual *wgpu.Device and *wgpu.Queue
+// wrapped as gpucontext.Device and gpucontext.Queue. Consumers type-assert
+// to the concrete wgpu types when they need the full API:
+//
+//	dev := provider.Device().(*wgpu.Device)
+//	halDevice := dev.HalDevice()
 type gpuContextAdapter struct {
 	renderer *Renderer
 	tracker  *resourceTracker
 	app      *App
 }
 
-// Device returns the GPU device implementing gpucontext.Device.
+// Device returns the underlying *wgpu.Device as gpucontext.Device.
+// Consumers should type-assert to *wgpu.Device for full API access.
 func (a *gpuContextAdapter) Device() gpucontext.Device {
-	if a.renderer == nil {
+	if a.renderer == nil || a.renderer.device == nil {
 		return nil
 	}
-	return &deviceAdapter{renderer: a.renderer}
+	return a.renderer.device
 }
 
-// Queue returns the GPU command queue implementing gpucontext.Queue.
+// Queue returns the underlying *wgpu.Queue as gpucontext.Queue.
+// Consumers should type-assert to *wgpu.Queue for full API access.
 func (a *gpuContextAdapter) Queue() gpucontext.Queue {
-	if a.renderer == nil {
+	if a.renderer == nil || a.renderer.device == nil {
 		return nil
 	}
-	return &queueAdapter{renderer: a.renderer}
+	return a.renderer.device.Queue()
 }
 
 // SurfaceFormat returns the preferred texture format for the surface.
@@ -37,37 +46,16 @@ func (a *gpuContextAdapter) SurfaceFormat() gputypes.TextureFormat {
 	if a.renderer == nil {
 		return gputypes.TextureFormatUndefined
 	}
-	// Map gogpu format to gputypes format.
-	// Both use the same values (WebGPU spec), but we convert for type safety.
 	return mapTextureFormat(a.renderer.format)
 }
 
-// Adapter returns the GPU adapter implementing gpucontext.Adapter.
+// Adapter returns the GPU adapter as gpucontext.Adapter.
+// Consumers should type-assert to *wgpu.Adapter for full API access.
 func (a *gpuContextAdapter) Adapter() gpucontext.Adapter {
-	if a.renderer == nil {
+	if a.renderer == nil || a.renderer.adapter == nil {
 		return nil
 	}
-	return &adapterAdapter{renderer: a.renderer}
-}
-
-// HalDevice returns the HAL device for direct GPU access.
-// Implements gpucontext.HalProvider.
-func (a *gpuContextAdapter) HalDevice() any {
-	if a.renderer == nil {
-		return nil
-	}
-	// Return the HAL device directly — no more duck-typing via backend.
-	return a.renderer.device
-}
-
-// HalQueue returns the HAL queue for direct GPU access.
-// Implements gpucontext.HalProvider.
-func (a *gpuContextAdapter) HalQueue() any {
-	if a.renderer == nil {
-		return nil
-	}
-	// Return the HAL queue directly — no more duck-typing via backend.
-	return a.renderer.queue
+	return a.renderer.adapter
 }
 
 // Size returns the current window size in logical points (DIP).
@@ -97,8 +85,6 @@ func (a *gpuContextAdapter) RequestRedraw() {
 }
 
 // TrackResource registers an io.Closer for automatic cleanup during shutdown.
-// This forwards to the App's resourceTracker, enabling ggcanvas and other
-// libraries to auto-register via duck typing without importing gogpu.
 func (a *gpuContextAdapter) TrackResource(c io.Closer) {
 	if a.tracker != nil {
 		a.tracker.Track(c, "")
@@ -115,48 +101,8 @@ func (a *gpuContextAdapter) UntrackResource(c io.Closer) {
 // Ensure gpuContextAdapter implements gpucontext.DeviceProvider.
 var _ gpucontext.DeviceProvider = (*gpuContextAdapter)(nil)
 
-// Ensure gpuContextAdapter implements gpucontext.HalProvider.
-var _ gpucontext.HalProvider = (*gpuContextAdapter)(nil)
-
 // Ensure gpuContextAdapter implements gpucontext.WindowProvider.
 var _ gpucontext.WindowProvider = (*gpuContextAdapter)(nil)
-
-// deviceAdapter wraps gogpu renderer to implement gpucontext.Device.
-type deviceAdapter struct {
-	renderer *Renderer
-}
-
-// Poll processes pending GPU operations.
-func (d *deviceAdapter) Poll(wait bool) {
-	// gogpu backend handles polling internally during frame submission.
-	// This is a no-op for now as the renderer manages device lifecycle.
-	_ = wait
-}
-
-// Destroy releases device resources.
-func (d *deviceAdapter) Destroy() {
-	// Device lifecycle is managed by Renderer.
-	// External code should not destroy the device directly.
-}
-
-// Ensure deviceAdapter implements gpucontext.Device.
-var _ gpucontext.Device = (*deviceAdapter)(nil)
-
-// queueAdapter wraps gogpu renderer to implement gpucontext.Queue.
-type queueAdapter struct {
-	renderer *Renderer
-}
-
-// Ensure queueAdapter implements gpucontext.Queue.
-var _ gpucontext.Queue = (*queueAdapter)(nil)
-
-// adapterAdapter wraps gogpu renderer to implement gpucontext.Adapter.
-type adapterAdapter struct {
-	renderer *Renderer
-}
-
-// Ensure adapterAdapter implements gpucontext.Adapter.
-var _ gpucontext.Adapter = (*adapterAdapter)(nil)
 
 // mapTextureFormat converts gogpu TextureFormat to gputypes TextureFormat.
 func mapTextureFormat(format gputypes.TextureFormat) gputypes.TextureFormat {
@@ -171,25 +117,10 @@ func mapTextureFormat(format gputypes.TextureFormat) gputypes.TextureFormat {
 }
 
 // GPUContextProvider returns a gpucontext.DeviceProvider for use with gg and other libraries.
-// This enables enterprise-grade dependency injection between gogpu and external packages.
-//
-// Example:
-//
-//	app := gogpu.NewApp(gogpu.Config{Title: "My App"})
-//
-//	app.OnDraw(func(ctx *gogpu.Context) {
-//	    // Get gpucontext provider for gg
-//	    provider := app.GPUContextProvider()
-//	    // ... use with gg
-//	})
-//
-// Note: GPUContextProvider is only valid after Run() has initialized
-// the renderer. Calling before Run() returns nil.
 func (a *App) GPUContextProvider() gpucontext.DeviceProvider {
 	if a.renderer == nil {
 		return nil
 	}
-	// Initialize tracker lazily so it is available for auto-registration.
 	if a.tracker == nil {
 		a.tracker = &resourceTracker{}
 	}

@@ -24,34 +24,36 @@ func TestGPUContextProviderNilBeforeRun(t *testing.T) {
 
 // TestGPUContextAdapterMethods tests the methods of gpuContextAdapter.
 func TestGPUContextAdapterMethods(t *testing.T) {
-	// Create a renderer with nil HAL interfaces (no actual GPU needed)
+	// Create a renderer with nil wgpu objects (no actual GPU needed)
 	renderer := &Renderer{
-		adapter: nil, // HAL interfaces are nil in test
+		adapter: nil,
 		device:  nil,
-		queue:   nil,
 		format:  gputypes.TextureFormatBGRA8Unorm,
 	}
 
 	adapter := &gpuContextAdapter{renderer: renderer}
 
 	t.Run("Device", func(t *testing.T) {
+		// Device returns nil when renderer.device is nil.
 		device := adapter.Device()
-		if device == nil {
-			t.Error("Device() should not return nil with valid renderer")
+		if device != nil {
+			t.Error("Device() should return nil when renderer.device is nil")
 		}
 	})
 
 	t.Run("Queue", func(t *testing.T) {
+		// Queue returns nil when renderer.device is nil.
 		queue := adapter.Queue()
-		if queue == nil {
-			t.Error("Queue() should not return nil with valid renderer")
+		if queue != nil {
+			t.Error("Queue() should return nil when renderer.device is nil")
 		}
 	})
 
 	t.Run("Adapter", func(t *testing.T) {
+		// Adapter returns nil when renderer.adapter is nil.
 		adpt := adapter.Adapter()
-		if adpt == nil {
-			t.Error("Adapter() should not return nil with valid renderer")
+		if adpt != nil {
+			t.Error("Adapter() should return nil when renderer.adapter is nil")
 		}
 	})
 
@@ -112,36 +114,4 @@ func TestMapTextureFormat(t *testing.T) {
 			}
 		})
 	}
-}
-
-// TestDeviceAdapterInterface verifies deviceAdapter implements gpucontext.Device.
-func TestDeviceAdapterInterface(t *testing.T) {
-	var _ gpucontext.Device = (*deviceAdapter)(nil)
-}
-
-// TestDeviceAdapterMethods tests deviceAdapter methods.
-func TestDeviceAdapterMethods(t *testing.T) {
-	renderer := &Renderer{device: nil}
-	device := &deviceAdapter{renderer: renderer}
-
-	t.Run("Poll", func(t *testing.T) {
-		// Should not panic
-		device.Poll(true)
-		device.Poll(false)
-	})
-
-	t.Run("Destroy", func(t *testing.T) {
-		// Should not panic
-		device.Destroy()
-	})
-}
-
-// TestQueueAdapterInterface verifies queueAdapter implements gpucontext.Queue.
-func TestQueueAdapterInterface(t *testing.T) {
-	var _ gpucontext.Queue = (*queueAdapter)(nil)
-}
-
-// TestAdapterAdapterInterface verifies adapterAdapter implements gpucontext.Adapter.
-func TestAdapterAdapterInterface(t *testing.T) {
-	var _ gpucontext.Adapter = (*adapterAdapter)(nil)
 }
