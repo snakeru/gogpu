@@ -45,18 +45,17 @@ type waylandPlatform struct {
 	envScaleFactor float64
 
 	// Window state
-	width        int
-	height       int
-	shouldClose  bool
-	closeEmitted bool // EventClose returned once, prevents infinite loop in PollEvents
-	configured   bool
+	width       int
+	height      int
+	shouldClose bool
+	configured  bool
 
-	// Pending resize from configure event
-	pendingWidth  int
-	pendingHeight int
-	hasResize     bool
-	savedWidth    int // pre-maximize size for restore
-	savedHeight   int
+	// Event queue (same pattern as X11 and Windows platforms)
+	events  []Event
+	eventMu sync.Mutex
+
+	savedWidth  int // pre-maximize size for restore
+	savedHeight int
 
 	// Pointer state tracking
 	pointerX  float64
@@ -420,6 +419,7 @@ func (p *waylandPlatform) initCSD(config Config) error {
 			p.mu.Lock()
 			p.shouldClose = true
 			p.mu.Unlock()
+			p.queueEvent(Event{Type: EventClose})
 			p.WakeUp() // unblock WaitEvents so main loop sees shouldClose
 		},
 	); err != nil {
@@ -712,10 +712,11 @@ func (p *waylandPlatform) setupInputCallbacks() {
 			p.mu.Lock()
 			p.shouldClose = true
 			p.mu.Unlock()
+			p.queueEvent(Event{Type: EventClose})
 			p.WakeUp() // unblock WaitEvents so main loop sees shouldClose
 		},
 		OnConfigure: func(width, height int32) {
-			logger().Debug("CSD-DEBUG: OnConfigure", "rawW", width, "rawH", height)
+			logger().Debug("wayland toplevel.configure", "rawW", width, "rawH", height)
 			p.mu.Lock()
 			defer p.mu.Unlock()
 
@@ -734,48 +735,44 @@ func (p *waylandPlatform) setupInputCallbacks() {
 			}
 
 			// Width/height of 0 means client can choose — restore to saved size.
-			// Saved size is content size (no CSD borders), so skip subtraction.
-			restoredFromSaved := false
 			if width == 0 && height == 0 && p.savedWidth > 0 {
 				width = int32(p.savedWidth)
 				height = int32(p.savedHeight)
 				p.savedWidth = 0
 				p.savedHeight = 0
-				restoredFromSaved = true
 			}
 			if width > 0 && height > 0 {
 				newWidth := int(width)
 				newHeight := int(height)
 
-				// CSD content = configure minus borders (compositor sends full window size).
-				// But restored size is already content — don't subtract again.
-				csdContentW := newWidth
-				csdContentH := newHeight
-				if !restoredFromSaved && p.libwl != nil && p.libwl.CSDActive() {
-					tbH, bW := p.libwl.CSDBorders()
-					csdContentW = newWidth - bW*2
-					csdContentH = newHeight - tbH - bW
-					if csdContentW < 1 {
-						csdContentW = 1
-					}
-					if csdContentH < 1 {
-						csdContentH = 1
+				// Geometry = content area (0, 0, contentW, contentH).
+				// Configure matches geometry → content size directly.
+				// On maximize: compositor sends full screen size, but we need room
+				// for the title bar inside the screen. Subtract only tbH.
+				vulkanW := newWidth
+				vulkanH := newHeight
+				if isMaximized && p.libwl != nil && p.libwl.CSDActive() {
+					tbH, _ := p.libwl.CSDBorders()
+					vulkanH = newHeight - tbH
+					if vulkanH < 1 {
+						vulkanH = 1
 					}
 				}
-
-				logger().Debug("CSD-DEBUG: OnConfigure adjusted", "vulkanW", newWidth, "vulkanH", newHeight, "csdContentW", csdContentW, "csdContentH", csdContentH)
-				if newWidth != p.width || newHeight != p.height {
-					logger().Warn("CSD-DEBUG: RESIZE TRIGGERED", "newW", newWidth, "newH", newHeight, "oldW", p.width, "oldH", p.height, "maximized", isMaximized)
-					p.pendingWidth = newWidth
-					p.pendingHeight = newHeight
-					p.hasResize = true
-					// Resize CSD decorations to match CSD content area
+				logger().Debug("wayland configure", "vulkanW", vulkanW, "vulkanH", vulkanH)
+				if vulkanW != p.width || vulkanH != p.height {
+					p.width = vulkanW
+					p.height = vulkanH
+					p.queueEvent(Event{
+						Type:           EventResize,
+						Width:          vulkanW,
+						Height:         vulkanH,
+						PhysicalWidth:  vulkanW,
+						PhysicalHeight: vulkanH,
+					})
+					// Schedule CSD resize for xdgSurfaceConfigureCb (after ack_configure).
 					if p.libwl != nil && p.libwl.CSDActive() {
-						p.libwl.ResizeCSD(csdContentW, csdContentH)
+						p.libwl.SetPendingCSDResize(vulkanW, vulkanH)
 					}
-					// Note: xdg_surface.configure will arrive on next PollEvents dispatch,
-					// AFTER Vulkan surface has been resized by the render loop.
-					// ack_configure + set_window_geometry + commit happen in that callback.
 				}
 			}
 		},
@@ -1531,38 +1528,22 @@ func evdevKeycodeToRune(keycode uint32, shift, capsLock bool) rune {
 	return 0
 }
 
-// PollEvents processes pending Wayland events.
+// PollEvents processes pending Wayland events using the event queue pattern.
+// Same architecture as X11 and Windows platforms: callbacks queue events,
+// PollEvents dequeues one at a time.
 func (p *waylandPlatform) PollEvents() Event {
-	p.mu.Lock()
-
-	// Check for pending resize
-	if p.hasResize {
-		p.width = p.pendingWidth
-		p.height = p.pendingHeight
-		p.hasResize = false
-		p.mu.Unlock()
-
-		return Event{
-			Type:           EventResize,
-			Width:          p.pendingWidth,
-			Height:         p.pendingHeight,
-			PhysicalWidth:  p.pendingWidth,
-			PhysicalHeight: p.pendingHeight,
-		}
+	// First, drain queued events (from previous dispatch).
+	p.eventMu.Lock()
+	if len(p.events) > 0 {
+		event := p.events[0]
+		p.events = p.events[1:]
+		p.eventMu.Unlock()
+		return event
 	}
-
-	// Check for close (emit once to prevent infinite loop in processEventsMultiThread)
-	if p.shouldClose && !p.closeEmitted {
-		p.closeEmitted = true
-		p.mu.Unlock()
-		return Event{Type: EventClose}
-	}
-
-	p.mu.Unlock()
+	p.eventMu.Unlock()
 
 	// Dispatch all pending events on the C display (single connection).
-	// Order: DispatchDefaultQueue reads from socket (all queues),
-	// then DispatchCSDEvents dispatches CSD queue events that were just read.
+	// Callbacks will queue events via queueEvent().
 	if p.libwl != nil {
 		// Read from socket + dispatch default queue (xdg, pointer, keyboard, touch)
 		if err := p.libwl.DispatchDefaultQueue(); err != nil {
@@ -1570,7 +1551,7 @@ func (p *waylandPlatform) PollEvents() Event {
 			p.mu.Lock()
 			p.shouldClose = true
 			p.mu.Unlock()
-			return Event{Type: EventClose}
+			p.queueEvent(Event{Type: EventClose})
 		}
 
 		// Dispatch CSD events (separate queue, read by DispatchDefaultQueue above)
@@ -1581,29 +1562,22 @@ func (p *waylandPlatform) PollEvents() Event {
 		}
 	}
 
-	// Check again after dispatch
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.hasResize {
-		p.width = p.pendingWidth
-		p.height = p.pendingHeight
-		p.hasResize = false
-		return Event{
-			Type:           EventResize,
-			Width:          p.pendingWidth,
-			Height:         p.pendingHeight,
-			PhysicalWidth:  p.pendingWidth,
-			PhysicalHeight: p.pendingHeight,
-		}
+	// Return first queued event, or EventNone if empty.
+	p.eventMu.Lock()
+	defer p.eventMu.Unlock()
+	if len(p.events) > 0 {
+		event := p.events[0]
+		p.events = p.events[1:]
+		return event
 	}
-
-	if p.shouldClose && !p.closeEmitted {
-		p.closeEmitted = true
-		return Event{Type: EventClose}
-	}
-
 	return Event{Type: EventNone}
+}
+
+// queueEvent appends a platform event to the event queue.
+func (p *waylandPlatform) queueEvent(event Event) {
+	p.eventMu.Lock()
+	defer p.eventMu.Unlock()
+	p.events = append(p.events, event)
 }
 
 // ShouldClose returns true if window close was requested.
@@ -1974,4 +1948,5 @@ func (p *waylandPlatform) CloseWindow() {
 	p.mu.Lock()
 	p.shouldClose = true
 	p.mu.Unlock()
+	p.queueEvent(Event{Type: EventClose})
 }

@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.26.1] - 2026-04-05
+
+### Fixed
+
+- **Wayland CSD resize** — Complete CSD resize overhaul:
+  - Interactive edge resize works correctly (no jump on first click)
+  - Maximize: title bar at (0,0) inside window, borders destroyed to clear
+    WSLg ghost pixels. Content fills screen below title bar.
+  - Restore: borders recreated, title bar returns to normal position.
+  - `set_window_geometry` = content area (0,0), no negative origin (WSLg compat).
+  - (BUG-CSD-001, BUG-WAYLAND-001)
+- **Wayland PollEvents queue pattern** — Replaced `closeEmitted`/`hasResize` flags
+  with event queue (same architecture as X11 and Windows platforms).
+  Events from Wayland callbacks are queued, PollEvents dequeues one at a time.
+
+### Added
+
+- **Programmatic DPI awareness** — Windows apps are now automatically DPI-aware
+  without requiring a manifest file. Uses `SetProcessDpiAwarenessContext`
+  (PerMonitorV2, Win10 1703+) with fallback to `SetProcessDPIAware` (Vista+).
+  Fixes blurry text on high-DPI displays (200%+). Mouse coordinates converted
+  from physical to logical pixels for correct hit-testing on high-DPI.
+  (TASK-GOGPU-DPI-001, BUG-GOGPU-DPI-001)
+
+### Changed (Dependencies)
+
+- **wgpu** v0.23.0 → **v0.23.9** (GLES ADJUST_COORDINATE_SPACE, DX12 deferred resource destruction, DRED diagnostics, shader cache, Vulkan validation fixes)
+- **naga** v0.15.0 → **v0.16.6** (HLSL 72/72, SPIR-V 164/164, ForceLoopBounding, zero-init loop 330× faster FXC, GLSL zero-init loop)
+- **gputypes** v0.3.0 → **v0.4.0** (new vertex format constants, blend constant type)
+
 ## [0.26.0] - 2026-03-31
 
 ### Added

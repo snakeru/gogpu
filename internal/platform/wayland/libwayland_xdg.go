@@ -209,21 +209,46 @@ func xdgSurfaceConfigureCb(data, xdgSurface, serial uintptr) {
 	if h == nil {
 		return
 	}
-	slog.Warn("CSD-DEBUG: surface.configure", "serial", uint32(serial))
+	slog.Debug("xdg_surface.configure", "serial", uint32(serial), "configuredW", h.configuredW, "configuredH", h.configuredH)
 
 	// ack_configure = xdg_surface opcode 4, arg: serial (uint32)
 	h.marshalVoid(h.xdgSurface, 4, serial)
-	slog.Debug("CSD-DEBUG: ack_configure sent", "serial", uint32(serial))
+	slog.Debug("ack_configure sent", "serial", uint32(serial))
 
-	// Set window geometry = configure size (must match what compositor expects).
-	// Compositor validates: geometry must equal configure size for maximized state.
-	if h.configuredW > 0 && h.configuredH > 0 {
-		h.marshalVoid(h.xdgSurface, 3, 0, 0, uintptr(uint32(h.configuredW)), uintptr(uint32(h.configuredH)))
+	// Resize CSD subsurfaces AFTER ack_configure, BEFORE parent commit.
+	// Subsurfaces in sync mode have their state applied atomically with the parent commit.
+	// This is the GLFW pattern: ack_configure -> resizeWindow -> commit.
+	if h.csdPendingResize {
+		h.csdPendingResize = false
+		h.csdPendingRepaint = false // resize already repaints all surfaces
+		h.ResizeCSD(h.csdPendingResizeW, h.csdPendingResizeH)
+	}
+
+	// Set window geometry = content area (0, 0, contentW, contentH).
+	// CSD subsurfaces are OUTSIDE geometry (title bar at negative offset, borders at edges).
+	// Configure events match geometry → content size directly, NO border subtraction.
+	// Negative origin (-bW, -tbH) causes resize jump on WSLg — avoid it.
+	if h.csdActive && h.csdContentW > 0 {
+		geoY := int32(0)
+		geoH := h.csdContentH
+		if h.csdState.Maximized {
+			// On maximize: title bar at (0,0) inside window. Geometry must include
+			// title bar area so compositor positions window with title bar visible.
+			tbH := h.csdPainter.TitleBarHeight()
+			geoH = h.csdContentH + tbH
+		}
+		slog.Debug("set_window_geometry CSD", "x", 0, "y", geoY, "w", h.csdContentW, "h", geoH)
+		h.marshalVoid(h.xdgSurface, 3, 0, uintptr(uint32(geoY)),
+			uintptr(uint32(h.csdContentW)), uintptr(uint32(geoH)))
+	} else if h.configuredW > 0 && h.configuredH > 0 {
+		slog.Debug("set_window_geometry non-CSD", "w", h.configuredW, "h", h.configuredH)
+		h.marshalVoid(h.xdgSurface, 3, 0, 0,
+			uintptr(uint32(h.configuredW)), uintptr(uint32(h.configuredH)))
 	}
 
 	// Commit the main surface — atomic: ack + geometry + subsurface changes all at once.
 	h.marshalVoid(h.surface, 6)
-	slog.Debug("CSD-DEBUG: parent surface committed")
+	slog.Debug("parent surface committed")
 }
 
 // xdgWmBasePingCb handles xdg_wm_base.ping(data, xdg_wm_base, serial).
