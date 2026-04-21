@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.27.1] - 2026-04-21
+
+### Added
+
+- **Adapter power preference** — `Config.PowerPreference` controls GPU selection on dual-GPU systems (laptops with integrated + discrete). `WithPowerPreference()` builder + `GOGPU_POWER_PREFERENCE` env var (`low`/`high`). Default `None` preserves existing behavior. (#176)
+- **Wayland pointer lock** — `SetCursorMode()` now works on Wayland via `zwp_pointer_constraints_v1` + `zwp_relative_pointer_v1` protocols. Locked mode hides cursor and delivers relative deltas (`PointerEvent.DeltaX/DeltaY`). Confined mode restricts cursor to surface. Persistent lifetime (auto-relock on focus regain). Graceful degradation if compositor doesn't support the protocols. Completes v0.27.0 platform parity for pointer lock (Win32 + X11 + Wayland). (#175)
+
+### Fixed
+
+- **X11 event loop:** fixed dual-poller race that blocked resize/close events with `ContinuousRender(false)`. Root cause: `unix.Poll()` on dup'd fd competed with Go runtime netpoller on original `net.Conn` fd. Replaced with channel-based wait using `PollEventTimeout` through Go's single runtime poller. (#178)
+- **macOS software backend:** added `setNeedsDisplay:` calls after `setContents:` in `BlitPixels` — per Apple docs, Core Animation requires explicit display trigger after setting layer contents. Without this, the window stayed blank until an external recomposite event. (#172)
+- **Software backend:** removed redundant `blitSoftwareFramebuffer()` call in `EndFrame()` — was causing flicker and ~12% CPU overhead at fullscreen. `surface.Present()` already handles GDI blit via SurfaceTexture buffer.
+
+### Changed
+
+- **Dependencies:** wgpu v0.24.4 → v0.25.1, naga v0.17.4 (indirect), gpucontext v0.12.0 (CursorMode), golang.org/x/sys v0.43.0
+- **Cleanup:** removed dead test files in `tmp/` that caused `go build ./...` failure (multiple `main` declarations) and incorrectly pulled `naga` as a direct dependency
+
 ## [0.27.0] - 2026-04-09
 
 ### Added

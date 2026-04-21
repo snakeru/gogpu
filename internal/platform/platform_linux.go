@@ -66,6 +66,9 @@ type waylandPlatform struct {
 	pointerIn bool // True when pointer is inside our surface
 	startTime time.Time
 
+	// Cursor mode (0=normal, 1=locked, 2=confined)
+	cursorMode int
+
 	// Keyboard focus tracking
 	keyboardFocused bool
 
@@ -81,9 +84,10 @@ type waylandPlatform struct {
 type x11Platform struct {
 	inner *x11.Platform
 
-	// Wakeup pipe for cross-goroutine WakeUp → WaitEvents unblocking.
-	// [0]=read, [1]=write. Created with O_NONBLOCK|O_CLOEXEC.
-	wakePipe [2]int
+	// Channel-based wakeup for cross-goroutine WakeUp → WaitEvents unblocking.
+	// Replaces the wakePipe+unix.Poll pattern to avoid dual-poller race with
+	// net.Conn (Go runtime netpoller vs kernel poll on dup'd fd).
+	wakeCh chan struct{}
 }
 
 // newPlatform creates the platform-specific implementation.
@@ -123,11 +127,7 @@ func (p *x11Platform) Init(config Config) error {
 		return err
 	}
 
-	// Create wakeup pipe for WakeUp → WaitEvents unblocking
-	if err := unix.Pipe2(p.wakePipe[:], unix.O_NONBLOCK|unix.O_CLOEXEC); err != nil {
-		p.inner.Destroy()
-		return fmt.Errorf("x11: wakeup pipe: %w", err)
-	}
+	p.wakeCh = make(chan struct{}, 1)
 
 	return nil
 }
@@ -176,11 +176,6 @@ func (p *x11Platform) GetHandle() (instance, window uintptr) {
 
 // Destroy closes the window and releases resources.
 func (p *x11Platform) Destroy() {
-	if p.wakePipe[0] != 0 {
-		_ = unix.Close(p.wakePipe[0])
-		_ = unix.Close(p.wakePipe[1])
-		p.wakePipe = [2]int{}
-	}
 	p.inner.Destroy()
 }
 
@@ -215,31 +210,38 @@ func (p *x11Platform) SetCharCallback(fn func(rune)) {
 // X11 doesn't have modal resize loops.
 func (p *x11Platform) SetModalFrameCallback(_ func()) {}
 
-// WaitEvents blocks until at least one OS event is available.
-// Uses unix.Poll on the X11 socket fd and a wakeup pipe to block with 0% CPU.
+// WaitEvents blocks until at least one OS event is available or WakeUp is called.
+// Uses PollEventTimeout on the X11 net.Conn (Go runtime netpoller) with periodic
+// wake channel checks. This avoids the dual-poller race between unix.Poll on a
+// dup'd fd and Go's runtime netpoller on the original net.Conn.
 func (p *x11Platform) WaitEvents() {
-	connFd := p.inner.Fd()
-	if connFd < 0 {
-		return
-	}
+	for {
+		select {
+		case <-p.wakeCh:
+			return
+		default:
+		}
 
-	fds := []unix.PollFd{
-		{Fd: int32(connFd), Events: unix.POLLIN | unix.POLLERR},
-		{Fd: int32(p.wakePipe[0]), Events: unix.POLLIN},
+		event, err := p.inner.PollEventTimeout(100 * time.Millisecond)
+		if err != nil {
+			return
+		}
+		if event != nil {
+			if pe := p.inner.HandleEvent(event); pe.Type != x11.EventTypeNone {
+				p.inner.QueueEvent(pe)
+			}
+			return
+		}
 	}
-	// Block indefinitely until an event arrives or WakeUp is called.
-	// EINTR from signal delivery is harmless — returns as spurious wakeup.
-	_, _ = unix.Poll(fds, -1)
-
-	// Drain the wakeup pipe so it is ready for the next WakeUp call.
-	drainPipe(p.wakePipe[0])
 }
 
 // WakeUp unblocks WaitEvents from any goroutine.
-// Writing a single byte to the pipe wakes up unix.Poll immediately.
-// Safe from any goroutine — pipe writes <= PIPE_BUF (4096 on Linux) are atomic.
+// Non-blocking channel send ensures at most one pending signal.
 func (p *x11Platform) WakeUp() {
-	_, _ = unix.Write(p.wakePipe[1], []byte{0})
+	select {
+	case p.wakeCh <- struct{}{}:
+	default:
+	}
 }
 
 // Init creates the Wayland window using a single C libwayland connection.
@@ -367,6 +369,24 @@ func (p *waylandPlatform) initSingleConnection(config Config) error {
 	if seatGlobal != nil {
 		if err := libwl.SetupInput(seatGlobal.Name, seatGlobal.Version); err != nil {
 			logger().Warn("input setup failed", "err", err)
+		}
+	}
+
+	// Bind pointer constraints and relative pointer protocols (optional, for mouse grab)
+	ptrConstraintsGlobal := registry.GetGlobalByInterface(wayland.InterfaceZwpPointerConstraintsV1)
+	if ptrConstraintsGlobal != nil {
+		if err := libwl.SetupPointerConstraints(ptrConstraintsGlobal.Name, ptrConstraintsGlobal.Version); err != nil {
+			logger().Warn("pointer constraints setup failed (mouse grab unavailable)", "err", err)
+		} else {
+			logger().Debug("pointer constraints protocol bound")
+		}
+	}
+	relPointerGlobal := registry.GetGlobalByInterface(wayland.InterfaceZwpRelativePointerManagerV1)
+	if relPointerGlobal != nil {
+		if err := libwl.SetupRelativePointerManager(relPointerGlobal.Name, relPointerGlobal.Version); err != nil {
+			logger().Warn("relative pointer setup failed", "err", err)
+		} else {
+			logger().Debug("relative pointer manager bound")
 		}
 	}
 
@@ -702,6 +722,52 @@ func (p *waylandPlatform) setupInputCallbacks() {
 				PointerID:   2,
 				PointerType: gpucontext.PointerTypeTouch,
 				IsPrimary:   true,
+				Timestamp:   p.eventTimestamp(),
+			})
+		},
+
+		// Pointer constraint events
+		OnLockedPointerLocked: func() {
+			logger().Debug("wayland: pointer lock activated by compositor")
+		},
+		OnLockedPointerUnlocked: func() {
+			logger().Debug("wayland: pointer lock deactivated by compositor")
+		},
+		OnRelativePointerMotion: func(timeUs uint64, dx, dy, dxUnaccel, dyUnaccel float64) {
+			// Read cursor mode under p.mu (SetCursorMode writes under p.mu).
+			p.mu.Lock()
+			mode := p.cursorMode
+			p.mu.Unlock()
+
+			// Only dispatch relative motion when in locked mode.
+			// In normal/confined mode, absolute motion events are used.
+			if mode != 1 {
+				return
+			}
+
+			p.pointerMu.RLock()
+			buttons := p.buttons
+			p.pointerMu.RUnlock()
+
+			var pressure float32
+			if buttons != gpucontext.ButtonsNone {
+				pressure = 0.5
+			}
+
+			// In locked mode, X/Y stay at the lock position; only DeltaX/DeltaY matter.
+			p.dispatchPointerEvent(gpucontext.PointerEvent{
+				Type:        gpucontext.PointerMove,
+				PointerID:   1,
+				DeltaX:      dx,
+				DeltaY:      dy,
+				Pressure:    pressure,
+				Width:       1,
+				Height:      1,
+				PointerType: gpucontext.PointerTypeMouse,
+				IsPrimary:   true,
+				Button:      gpucontext.ButtonNone,
+				Buttons:     buttons,
+				Modifiers:   p.getModifiers(),
 				Timestamp:   p.eventTimestamp(),
 			})
 		},
@@ -1783,12 +1849,100 @@ func (p *waylandPlatform) ClipboardWrite(string) error { return nil }
 // attach via wl_pointer.set_cursor. Both approaches are significant effort.
 func (p *waylandPlatform) SetCursor(int) {}
 
-// SetCursorMode is a stub on Wayland. Full implementation requires
-// zwp_pointer_constraints_v1 and zwp_relative_pointer_v1 protocols.
-func (p *waylandPlatform) SetCursorMode(int) {}
+// SetCursorMode sets cursor confinement/lock mode on Wayland.
+// 0=normal, 1=locked (hidden + pointer lock + relative deltas), 2=confined (visible + confined to surface).
+// Uses zwp_pointer_constraints_v1 for lock/confine and zwp_relative_pointer_v1 for relative motion.
+func (p *waylandPlatform) SetCursorMode(mode int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
-// CursorMode returns 0 (normal) — cursor mode not yet implemented on Wayland.
-func (p *waylandPlatform) CursorMode() int { return 0 }
+	if mode == p.cursorMode {
+		return
+	}
+
+	if p.libwl == nil {
+		return
+	}
+
+	surface := p.libwl.Surface()
+	pointer := p.libwl.InputPointer()
+	if surface == 0 || pointer == 0 {
+		logger().Warn("wayland: SetCursorMode requires surface and pointer", "mode", mode)
+		return
+	}
+
+	// Release any existing constraints before applying new mode
+	p.releasePointerConstraints()
+
+	switch mode {
+	case 1: // Locked — hide cursor, lock pointer, receive relative deltas
+		if !p.libwl.HasPointerConstraints() {
+			logger().Warn("wayland: pointer constraints not supported by compositor, cannot lock")
+			return
+		}
+
+		// Lock pointer to surface (persistent lifetime=1 for auto re-lock on focus)
+		if err := p.libwl.LockPointer(surface, pointer, 1); err != nil {
+			logger().Warn("wayland: lock_pointer failed", "err", err)
+			return
+		}
+
+		// Set up relative pointer for motion deltas (used instead of absolute coords)
+		if p.libwl.HasRelativePointerManager() {
+			if err := p.libwl.GetRelativePointer(pointer); err != nil {
+				logger().Warn("wayland: get_relative_pointer failed", "err", err)
+			}
+		}
+
+		// Hide cursor: set_cursor with NULL surface
+		p.libwl.HideCursor(p.libwl.PointerEnterSerial())
+
+		p.cursorMode = 1
+
+	case 2: // Confined — cursor visible but confined to surface bounds
+		if !p.libwl.HasPointerConstraints() {
+			logger().Warn("wayland: pointer constraints not supported by compositor, cannot confine")
+			return
+		}
+
+		// Confine pointer to surface (persistent lifetime=1)
+		if err := p.libwl.ConfinePointer(surface, pointer, 1); err != nil {
+			logger().Warn("wayland: confine_pointer failed", "err", err)
+			return
+		}
+
+		p.cursorMode = 2
+
+	default: // Normal (0) — release all constraints, show cursor
+		// Constraints already released by releasePointerConstraints above.
+		// Cursor restoration happens automatically when the compositor processes
+		// the constraint destroy and the pointer re-enters the surface.
+		p.cursorMode = 0
+	}
+
+	// Flush to send all protocol requests immediately
+	if err := p.libwl.Flush(); err != nil {
+		logger().Warn("wayland: flush failed after SetCursorMode", "err", err)
+	}
+}
+
+// releasePointerConstraints destroys all active pointer constraints and relative pointer.
+// Must be called with p.mu held.
+func (p *waylandPlatform) releasePointerConstraints() {
+	if p.libwl == nil {
+		return
+	}
+	p.libwl.DestroyLockedPointer()
+	p.libwl.DestroyConfinedPointer()
+	p.libwl.DestroyRelativePointer()
+}
+
+// CursorMode returns the current cursor mode.
+func (p *waylandPlatform) CursorMode() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.cursorMode
+}
 
 // DarkMode returns true if the system dark mode is active.
 // Checks GTK_THEME environment variable and KDE kdeglobals config.

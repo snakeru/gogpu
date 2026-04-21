@@ -16,12 +16,6 @@ import (
 	"github.com/gogpu/wgpu/hal"
 )
 
-// framebufferReader is an optional interface for surfaces that support
-// direct framebuffer readback (software backend).
-type framebufferReader interface {
-	GetFramebuffer() []byte
-}
-
 // texQuadUniformSize is the size of the uniform buffer for textured quads.
 // Layout: rect(4 floats) + screen(2 floats) + alpha(1 float) + premultiplied(1 float) = 32 bytes
 const texQuadUniformSize = 32
@@ -96,13 +90,17 @@ type Renderer struct {
 
 	// VSync preference from Config
 	vsync bool
+
+	// PowerPreference for adapter selection
+	powerPreference gputypes.PowerPreference
 }
 
 // newRenderer creates and initializes a new renderer.
-func newRenderer(plat platform.Platform, backendType types.BackendType, graphicsAPI types.GraphicsAPI, vsync bool) (*Renderer, error) {
+func newRenderer(plat platform.Platform, backendType types.BackendType, graphicsAPI types.GraphicsAPI, vsync bool, powerPref gputypes.PowerPreference) (*Renderer, error) {
 	r := &Renderer{
-		platform: plat,
-		vsync:    vsync,
+		platform:        plat,
+		vsync:           vsync,
+		powerPreference: powerPref,
 	}
 
 	if err := r.init(backendType, graphicsAPI); err != nil {
@@ -180,6 +178,7 @@ func (r *Renderer) initNative(graphicsAPI types.GraphicsAPI) error {
 	// adapter enumeration until a surface (GL context) is available.
 	r.adapter, err = r.instance.RequestAdapter(&wgpu.RequestAdapterOptions{
 		CompatibleSurface: r.surface,
+		PowerPreference:   r.powerPreference,
 	})
 	if err != nil {
 		return fmt.Errorf("gogpu: failed to request adapter: %w", err)
@@ -476,7 +475,6 @@ func (r *Renderer) EndFrame() {
 		if err := r.surface.Present(r.currentSurfaceTexture); err != nil {
 			slog.Error("PRESENT ERROR", "err", err)
 		}
-		r.blitSoftwareFramebuffer()
 	}
 
 	// Non-blocking submission tracking: free resources for completed submissions.
@@ -490,30 +488,6 @@ func (r *Renderer) EndFrame() {
 	}
 	// SurfaceTexture is consumed by Present, no need to destroy it
 	r.currentSurfaceTexture = nil
-}
-
-// blitSoftwareFramebuffer copies software-rendered pixels to the window.
-// Called from EndFrame after Present. Uses interface type assertions to
-// avoid importing the software package -- clean separation.
-func (r *Renderer) blitSoftwareFramebuffer() {
-	// For software backend, the underlying HAL surface implements framebufferReader.
-	halSurface := r.surface.HAL()
-	if halSurface == nil {
-		return
-	}
-	fbr, ok := halSurface.(framebufferReader)
-	if !ok {
-		return // Not software backend
-	}
-	blitter, ok := r.platform.(platform.PixelBlitter)
-	if !ok {
-		return // Platform doesn't support blitting
-	}
-	pixels := fbr.GetFramebuffer()
-	if pixels == nil {
-		return
-	}
-	_ = blitter.BlitPixels(pixels, int(r.width), int(r.height))
 }
 
 // Clear defers a clear command to be applied at the start of the next render pass.
