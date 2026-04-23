@@ -24,12 +24,11 @@ func TestGPUContextProviderNilBeforeRun(t *testing.T) {
 
 // TestGPUContextAdapterMethods tests the methods of gpuContextAdapter.
 func TestGPUContextAdapterMethods(t *testing.T) {
-	// Create a renderer with nil wgpu objects (no actual GPU needed)
-	renderer := &Renderer{
-		adapter: nil,
-		device:  nil,
-		format:  gputypes.TextureFormatBGRA8Unorm,
-	}
+	// Create a renderer with nil wgpu objects (no actual GPU needed).
+	// Surface format is stored on the primary windowSurface.
+	renderer := newTestRendererFull(800, 600, gputypes.TextureFormatBGRA8Unorm, "test")
+	renderer.adapter = nil
+	renderer.device = nil
 
 	adapter := &gpuContextAdapter{renderer: renderer}
 
@@ -119,8 +118,8 @@ func TestMapTextureFormat(t *testing.T) {
 // TestGPUContextAdapterWindowProvider tests WindowProvider delegation.
 func TestGPUContextAdapterWindowProvider(t *testing.T) {
 	t.Run("Size with app", func(t *testing.T) {
-		mock := &mockPlatform{width: 1280, height: 720, scaleFactor: 1.0}
-		app := &App{platform: mock}
+		mock := &mockWindow{width: 1280, height: 720, scaleFactor: 1.0}
+		app := &App{platWindow: mock}
 		adapter := &gpuContextAdapter{app: app}
 
 		w, h := adapter.Size()
@@ -139,8 +138,8 @@ func TestGPUContextAdapterWindowProvider(t *testing.T) {
 	})
 
 	t.Run("ScaleFactor with app", func(t *testing.T) {
-		mock := &mockPlatform{scaleFactor: 2.0}
-		app := &App{platform: mock}
+		mock := &mockWindow{scaleFactor: 2.0}
+		app := &App{platWindow: mock}
 		adapter := &gpuContextAdapter{app: app}
 
 		sf := adapter.ScaleFactor()
